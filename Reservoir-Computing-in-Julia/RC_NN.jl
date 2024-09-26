@@ -77,7 +77,8 @@ R_test = zeros(dim_reservoir, length(t2))
 r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*IC_validate)))
 for t in 1:length(t2)
     R_test[:,t] = r_state
-    r_state = swish.(A*r_state + W_in*test_data[t,:])
+    #r_state = swish.(A*r_state + W_in*test_data[t,:])
+    r_state = swish.(W_in*test_data[t,:])
 end
 
 
@@ -117,7 +118,7 @@ lines!(ax3, t2, test_data[:,3], color = :purple)
 lines!(ax3, t2, X_predicted[1:length(t2),3], color = :yellow)
 
 fig
-GLMakie.save("lorenz.png", fig)
+GLMakie.save("lorenz_NN_A_0.png", fig)
 
 # Create a new figure
 fig = Figure(resolution = (800, 600))
@@ -132,4 +133,4 @@ axislegend(ax)
 
 # Display the figure
 fig
-GLMakie.save("lorenz3d.png", fig)
+GLMakie.save("lorenz3d_NN_A_0.png", fig)

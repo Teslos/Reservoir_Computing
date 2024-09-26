@@ -73,6 +73,9 @@ for i in 1:length(t2)
     r_state = swish.(A*r_state + W_in*X_predicted[i,:])
 end
 
+# mean squared error
+MSE = sum((test_data .- X_predicted).^2)/length(t2)
+println("MSE: ", MSE)
 # plot the results
 using GLMakie
 
@@ -90,7 +93,7 @@ lines!(ax3, t2, test_data[:,3], color = :purple)
 lines!(ax3, t2, X_predicted[:,3], color = :yellow)
 
 fig
-GLMakie.save("lorenz.png", fig)
+GLMakie.save("lorenz_RC.png", fig)
 
 # Create a new figure
 fig = Figure(resolution = (800, 600))
@@ -105,4 +108,4 @@ axislegend(ax)
 
 # Display the figure
 fig
-GLMakie.save("lorenz3d.png", fig)
+GLMakie.save("lorenz3d_RC.png", fig)
