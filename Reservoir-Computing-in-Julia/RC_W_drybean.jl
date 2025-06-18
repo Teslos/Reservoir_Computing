@@ -42,7 +42,8 @@ function generate_reservoir(dim_reservoir, density)
 end
 
 # read the dry bean dataset
-db = drybean.read_drybean()
+current_path = pwd()
+db = drybean.read_drybean(current_path * "\\Reservoir-Computing-in-Julia\\data\\DryBeanDataset.csv")
 x = Matrix(permutedims(db))
 function normalize_rows(x::AbstractMatrix)
     x = x ./ maximum(x, dims=2)
@@ -124,7 +125,7 @@ function accuracy(model, ps, st, dataloader, A, W_in, W_out, r_state)
         predict_class = model(y_out, ps, st)
         
         predicted_class = onecold(Array(first(predict_class)))
-        println("predicted_class:",predicted_class)
+        #println("predicted_class:",predicted_class)
         #exit()
         total_correct += sum(target_class .== predicted_class)
         total += length(y)

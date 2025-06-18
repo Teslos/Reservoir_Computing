@@ -1,4 +1,6 @@
 using OrdinaryDiffEq
+using MLJLinearModels: RidgeRegression, fit
+using MLJ
 using LinearAlgebra
 using NNlib: swish
 
@@ -63,6 +65,23 @@ end
 # using the ridge regression to fit output weights
 W_out = (train_data'*R')*inv( (R*R') + beta * I(dim_reservoir) )
 
+# Ridge Regression Optimizer
+function ridge_regression_opt(X, y, λ::Float64)
+    # Ensure X and y have compatible dimensions
+    if size(X, 1) != size(y, 1)
+        throw(DimensionMismatch("Number of rows in X and y must match."))
+    end
+
+    # Compute the Ridge Regression solution
+    n_features = size(X, 2)
+    Identity = I(n_features)  # Identity matrix
+    β = (X' * X + λ * I) \ (X' * y)  # Closed-form solution
+
+    return β
+end
+
+W_out_opt = ridge_regression_opt(R', train_data, beta)
+W_out = W_out_opt'
 X_predicted = zeros(length(t2), dim_system)
 r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*IC_validate)))
 
@@ -109,3 +128,21 @@ axislegend(ax)
 # Display the figure
 fig
 GLMakie.save("lorenz3d_RC.png", fig)
+
+# find maxima in z-coord of trajectory
+function find_maxima_in_z(trj::AbstractMatrix{<:Real})
+    z = trj[:, 3]              # extract the z-column
+    z_left   = z[1:end-2]      # z[1], …, z[N-2]
+    z_center = z[2:end-1]      # z[2], …, z[N-1]
+    z_right  = z[3:end]        # z[3], …, z[N]
+
+    is_max = (z_center .> z_left) .& (z_center .> z_right)
+    return z_center[is_max]
+end
+
+# plot Lorenz map
+maximal_values = find_maxima_in_z(X_predicted)
+maximal_trj = find_maxima_in_z(test_data)
+scatter(maximal_values[1:end-1], maximal_values[2:end])
+scatter!(maximal_trj[1:end-1], maximal_trj[2:end], color = :red)
+

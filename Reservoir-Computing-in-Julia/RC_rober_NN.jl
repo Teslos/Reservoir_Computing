@@ -24,14 +24,7 @@ function create_graph(N::Int=8, M::Int=8)
     g_directed = SimpleDiGraph(g_weighted)
     return g_directed, edge_weights
 end
-# create erdos-renyi graph
-function create_erdos_renyi_graph(N::Int64, prob::Float64)
-    g = erdos_renyi(N, prob)
-    edge_weights = ones(length(edges(g)))
-    g_weighted = SimpleDiGraph(g)
-    g_directed = SimpleDiGraph(g_weighted)
-    return g_directed, edge_weights
-end
+
 function create_watts_strogatz_graph(N::Int=5, k::Int=2, p::Float64=0.5)
     g = watts_strogatz(N, k, p)
     edge_weights = ones(length(edges(g)))
@@ -61,31 +54,21 @@ function generate_reservoir(dim_reservoir, density)
     return A
 end
 
-# generate the training data
-function lorenz!(dx, x, p, t)
-    sigma, rho, beta = p
-    dx[1] = sigma*(x[2] - x[1])
-    dx[2] = x[1]*(rho - x[3]) - x[2]
-    dx[3] = x[1]*x[2] - beta*x[3]
-end
-
-# find maxima in z-coord of trajectory
-function find_maxima_in_z(trj::AbstractMatrix{<:Real})
-    z = trj[:, 3]              # extract the z-column
-    z_left   = z[1:end-2]      # z[1], …, z[N-2]
-    z_center = z[2:end-1]      # z[2], …, z[N-1]
-    z_right  = z[3:end]        # z[3], …, z[N]
-
-    is_max = (z_center .> z_left) .& (z_center .> z_right)
-    return z_center[is_max]
+# define original stiff ODE system
+function robertson!(du, u, p, t)
+	y₁, y₂, y₃ = u
+	k₁, k₂, k₃ = p
+	du[1] = -k₁ * y₁ + k₃ * y₂ * y₃
+	du[2] =  k₁ * y₁ - k₂ * y₂^2 - k₃ * y₂ * y₃
+	du[3] =  k₂ * y₂^2
+	return nothing
 end
 
 # create graph 
-#g_directed, edge_weights = create_complete_graph(8*8)
+g_directed, edge_weights = create_complete_graph(8*8)
 #g_directed, edge_weights = create_barabasi_albert_graph(8*8, 12)
 #g_directed, edge_weights = create_graph(8, 8)
-#g_directed, edge_weights = create_watts_strogatz_graph(8*8, 32, 0.25)
-g_directed, edge_weights = create_erdos_renyi_graph(8*8, 0.1)
+#g_directed, edge_weights = create_watts_strogatz_graph(16*16, 32*2, 0.25)
 
 println("Number of nodes: ", nv(g_directed))
 println("Number of edges: ", size(edge_weights))
@@ -184,26 +167,41 @@ fhn_network! = network_dynamics(odeelevertex, odeeleedge, g_directed)
 
 
 
-# generate the training data for lorenz system
-u0 = [10;10;10]
-tspan = (0.0, 300.0)
-dt = 0.01
-p = (10.0, 28.0, 8/3) # sigma, rho, beta values
-prob = ODEProblem(lorenz!, u0, tspan, p)
-sol  = solve(prob, Tsit5(), saveat = dt, progress = true)
-train_data = hcat(sol.u...)'
-tlorenz = sol.t
+# generate the training data for Robertson system
+p0 = (0.04, 3e7, 1e7)
+u0 = [0.7; 0.2; 0.3]; u0 = u0./sum(u0) # to enforce sum(u) == 1.0
+tspan = (0.0, 1e7)
 
-# generate the test data
-IC_validate = [10.1; 10.0; 10.0]
-tspan2 = (0.0, 50.0)
-prob2 = ODEProblem(lorenz!, IC_validate, tspan2, p)
-sol2 = solve(prob2, Tsit5(), saveat = dt, progress = true)
-test_data = hcat(sol2.u...)'
-t2 = sol2.t
+tt = 10.0.^collect(range(-5.0, +5.0; length=33))
+modelODESize = length(u0)
+# generate the training data for the robertson system
 
+# define ODEProblem, optimize it, and solve for original ODE solution at (u0, p0)
+prob = ODEProblem(robertson!, u0, tspan, p0)
+sol_rob = solve(prob, Rosenbrock23(); abstol=1e-6, reltol=1e-6, saveat=tt)
+using Plots
+# plot the solution of the robertson system
+Plots.plot(sol_rob, xscale=:log, yscale=:log, label=["y1" "y2" "y3"], xlabel="Time", ylabel="Concentration", title="Robertson System Solution")
+# generate the training data
+trober = sol.t
+train_data = hcat(sol.u...)' # train_data is the solution of the Rober system
+
+# generate the testing data for the robertson system
+p0_test = (0.04, 3e7, 1.1e7)
+u0_test = [0.7; 0.2; 0.3]; u0_test = u0_test./sum(u0_test) # to enforce sum(u) == 1.0
+tspan_test = (0.0, 1e5)
+tt_test = 10.0.^collect(range(-5.0, +5.0; length=33))
+# define ODEProblem, optimize it, and solve for original ODE solution at (u0_test, p0_test)
+prob_test = ODEProblem(robertson!, u0_test, tspan_test, p0_test)
+sol_test = solve(prob_test, Rosenbrock23(); abstol=1e-6, reltol=1e-6, saveat=tt)
+
+# plot the solution of the robertson system
+Plots.plot(sol_test, xscale=:log, yscale=:log, label=["y1" "y2" "y3"], xlabel="Time", ylabel="Concentration", title="Robertson System Test Solution")
+# generate the testing data
+ttest = sol_test.t
+test_data = hcat(sol_test.u...)' # test_data is the solution of the Rober system
 dim_system = 3
-dim_reservoir = 2* nv(g_directed) # 2 times the number of nodes in the network
+dim_reservoir = 2*64
 
 sigma = 0.1 # input scaling
 density = 0.05 # density of the reservoir
@@ -220,24 +218,22 @@ R = zeros(dim_reservoir, length(tlorenz))
 N = nv(g_directed) # Number of nodes in the network
 const ϵ = 0.05 # time scale separation parameter, default value is 0.05
 const a = 0.5 # threshold parameter abs(a) < 1 is self-sustained limit cycle, abs(a) = 1 is a Hopf bifurcation
-const σ = 0.006 # coupling strength
+const σ = 0.06 # coupling strength
 const R0 = 0.5
 # different weights for edges, because the resitivity of the edges are always positive
 w_ij = [pdf(Normal(), x) for x in range(-1, 1, length=ne(g_directed))]
-gs = [Spline1D(tlorenz, (W_in*train_data')[i,:], k=2) for i in 1:nv(g_directed)]
+gs = [Spline1D(trober, (W_in*train_data')[i,:], k=2) for i in 1:nv(g_directed)]
 # Tuple of parameters for nodes and edges
 p = (gs,σ * w_ij)
-#Initial conditions
+# Initial conditions
 x0 = W_in*u0
-
 # Solving the ODE
 using OrdinaryDiffEq
 
-tspan = (0.0, 300.0)
-datasize = length(tlorenz)
-tsteps = range(tspan[1], tspan[2], length=datasize)
+tspan = (0.0, 1e5)
+
 prob = ODEProblem(fhn_network!, x0, tspan, p)
-sol = solve(prob, Tsit5(), saveat=tsteps)
+sol = solve(prob, Tsit5(), saveat=tt, progress=true)
 
 using GLMakie
 fig = Figure()
@@ -253,7 +249,7 @@ for i in 1:64
 end
 #axislegend(ax, position = :rt)
 fig
-GLMakie.save("RC_FHN_NN.png", fig)
+GLMakie.save("RC_rober_NN.png", fig)
 
 # instead of ridge regression, we can use neural network to fit the output weights
 using Flux
@@ -267,56 +263,14 @@ using Optimisers
 using MLDataUtils
 using Zygote
 
-#=
-# using the neural network to fit output weights
-const dev = gpu_device()
-const dev_cpu = cpu_device()
-model = Lux.Chain(Lux.Dense(64, 100, swish), Lux.Dense(100, dim_system))
-rng = Random.default_rng()
-nn_rc, st_rc = Lux.setup(rng, model) |> dev
-
-function loss(x, y, model, ps, st)
-    pred, st = model(x, ps, st)
-    loss = sum((pred .- y).^2)
-    return loss, st
-end
-loss_function(ps, st, x, y) = loss(x, y, model, ps, st)
-
-function train_model(model, ps, st, train_data, epochs=10000, batch_size=1024, learning_rate=0.001)
-    loss_history = []
-    loss_value = 0.0
-    opt = ADAM(learning_rate)
-    st_opt = Optimisers.setup(opt, st)
-    train_dataloader = DataLoader(train_data, batchsize=batch_size, shuffle=true) |> dev
-    for epoch in 1:epochs
-        for (x,y) in train_dataloader
-            (loss_value, st), back = Zygote.pullback(loss, x, y, model, ps, st)
-            grads = back((one(loss_value),nothing))[4]
-            st_opt, ps = Optimisers.update(st_opt, ps, grads)
-
-            push!(loss_history, loss_value)
-        end
-        if epoch % 100 == 0
-            println("Epoch $epoch, Loss: $loss_value")
-        end
-    end
-    return ps, st
-end
-
-ps, st = Lux.setup(rng, model) |> dev
-data = (u, train_data')
-ps, st = train_model(model, ps, st, data)
-
-
-println("Final Loss: ", loss(dev(u), dev(train_data'), model, ps, st)[1])
-=# 
 
 using FluxOptTools
 using Optim 
 # using the neural network to fit output weights
-model = Flux.Chain(Flux.Dense(dim_reservoir, 256, swish), Flux.Dense(256, dim_system))
+model = Flux.Chain(Flux.Dense(128, 256, swish), Flux.Dense(256, dim_system))
 loss(model) = mean(abs2, model(u) .- train_data')
 opt = Flux.Adam(0.01)
+
 Zygote.refresh()
 ps = Flux.params(model)
 lossfun, gradfun, fg!, p0 = optfuns(()->loss(model), ps)
@@ -327,36 +281,39 @@ res = Optim.optimize(Optim.only_fg!(fg!), p0, BFGS(), Optim.Options(iterations=1
 
 # final Loss
 println("Final Loss: ", loss(model))
-R_test = zeros(dim_reservoir, length(t2))
+u0 = [0.7; 0.2; 0.3]; u0 = u0./sum(u0)
+R_test = zeros(dim_reservoir, length(tt))
 # get prediction of the model for test data
-#r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*IC_validate)))
-ut = W_in*IC_validate
-gs = [Spline1D(t2, (W_in*test_data')[i,:], k=2) for i in 1:nv(g_directed)]
+ut = W_in*u0
+gs = [Spline1D(tt, (W_in*train_data')[i,:], k=2) for i in 1:nv(g_directed)]
 p = (gs,σ * w_ij)
-prob2 = remake(prob, u0=ut, tspan=tspan2, p=p)
-sol2 = solve(prob2, Tsit5(), saveat=t2)
+prob2 = remake(prob, u0=ut, p=p)
+sol2 = solve(prob2, Tsit5(), saveat=tt)
 r_test = sol2[:,:]
 # plot the r_test
 fig = Figure()
 ax = GLMakie.Axis(fig[1, 1], xlabel = "Time", ylabel = "u", title = "FitzHugh-Nagumo network")
 for i in 1:64
-    lines!(ax, t2, r_test[i,:], label="Oscillator $i")
+    lines!(ax, sol2.t, r_test[i,:], label="Oscillator $i")
     #text!(ax, t[end], u[i,end]+0.1, text=string("Oscillator ", i), align=(:right, :center))
 end
 fig
 r_state = zeros(128)
-X_predicted = zeros(dim_system, length(t2))
-X_predicted_rec = zeros(Float32, dim_system, length(t2))
-res_sol = solve(prob2, Tsit5(), u0=W_in*IC_validate, tspan=(t2[1], t2[2]))
-r_state = Array(res_sol[:,end])
-r_state = W_in * IC_validate # initial state of the reservoir
-#X_predicted_rec[:,1] = model(swish.(r_state)) # Wout * rstate
-for t in 1:length(t2)-1
-    X_predict = model(r_state) # Wout * rstate
-    res_sol = solve(prob2, Tsit5(), u0=r_state, tspan=(t2[t], t2[t+1]))
+X_predicted = zeros(dim_system, length(tt))
+X_predicted_rec = zeros(dim_system, length(tt))
+res_sol = solve(prob2, Tsit5(), u0=W_in*u0, tspan=(tt[1], tt[2]))
+r_state_u = swish.(res_sol[:,end])
+
+for t in 1:length(tt)-1
+    X_predict = model(r_state_u) # Wout * rstate
+    #println("X_predict: ", X_predict)
+    #t == 10 ? break : nothing
     X_predicted_rec[:,t] = X_predict
-    
-    r_state = res_sol[:,end]
+    res_sol = solve(prob2, Tsit5(), u0=r_state, tspan=(tt[t], tt[t+1]), saveat=[tt[t], tt[t+1]]) # reservoir compute the next state
+    println("res_sol: ", size(res_sol.u)) 
+    r_state_u = swish.(hcat(res_sol.u...)') # update the reservoir state
+    r_state = res_sol[:,1]
+    #r_state = model(r_state + W_in*test_data[t,:])
 end
 # predict the Lorenz system from the reservoir
 X_predicted = model(r_test)
@@ -383,7 +340,7 @@ for i in 1:length(t2)
 end
 =#
 # mean squared error
-MSE = sum((test_data .- X_predicted).^2)/length(t2)
+MSE = sum((test_data .- X_predicted).^2)/length(tt)
 MSE_rec = sum((test_data[1:50,:] .- X_predicted_rec[1:50,:]).^2)/50
 # plot the results
 using GLMakie
@@ -392,33 +349,31 @@ fig = Figure()
 ax1 = Axis(fig[1, 1], ylabel = "x")
 ax2 = Axis(fig[2, 1], ylabel = "y")
 ax3 = Axis(fig[3, 1], ylabel = "z", xlabel = "Time")
-xlims!(ax1, t2[1], 50.0)
-xlims!(ax2, t2[1], 50.0)
-xlims!(ax3, t2[1], 50.0)
-lines!(ax1, t2, test_data[:,1], color = :blue)
-lines!(ax1, t2, X_predicted_rec[1:length(t2),1], color = :red)
+xlims!(ax1, tt[1], tt[end])
+xlims!(ax2, tt[1], tt[end])
+xlims!(ax3, tt[1], tt[end])
+lines!(ax1, tt, test_data[:,1], color = :blue)
+lines!(ax1, tt, X_predicted[1:length(tt),1], color = :red, linestyle = :dash)
 
-lines!(ax2, t2, test_data[:,2], color = :green)
-lines!(ax2, t2, X_predicted_rec[1:length(t2),2], color = :orange)
+lines!(ax2, tt, test_data[:,2], color = :green)
+lines!(ax2, tt, X_predicted[1:length(tt),2], color = :orange, linestyle = :dash)
 
-lines!(ax3, t2, test_data[:,3], color = :purple)
-lines!(ax3, t2, X_predicted_rec[1:length(t2),3], color = :cyan)
+lines!(ax3, tt, test_data[:,3], color = :purple)
+lines!(ax3, tt, X_predicted[1:length(tt),3], color = :cyan, linestyle = :dash)
 
 fig
-GLMakie.save("lorenz_FHN_NN.png", fig)
+GLMakie.save("robertson_FHN_NN.png", fig)
 
 using Optim
 
 # Create a new figure
 fig = Figure(resolution = (1600, 1200))
 index_15_sec = findfirst(x -> x > 15.0, t2)
-index_10_sec = findfirst(x -> x > 10.0, t2)
 range15 = 1:index_15_sec
-range10 = 1:index_10_sec
 # 3D plot
 ax = Axis3(fig[1, 1], title = "Predicting Lorenz 63", xlabel = "x", ylabel = "y", zlabel = "z")
-lines!(ax, test_data[:, 1], test_data[:, 2], test_data[:, 3], color = :blue, label = "True")
-lines!(ax, X_predicted_rec[:, 1], X_predicted_rec[:, 2],X_predicted_rec[:, 3], color = :red, label = "Predicted")
+lines!(ax, test_data[range15, 1], test_data[range15, 2], test_data[range15, 3], color = :blue, label = "True")
+lines!(ax, X_predicted[range15, 1], X_predicted[range15, 2],X_predicted[range15, 3], color = :red, label = "Predicted")
 
 # Add grid and legend
 axislegend(ax)
@@ -426,13 +381,3 @@ axislegend(ax)
 # Display the figure
 fig
 GLMakie.save("lorenz3d_FHN_NN.png", fig)
-
-# plot Lorenz map
-maximal_values = find_maxima_in_z(test_data[range10,:])
-scatter(maximal_values[1:end-1], maximal_values[2:end])
-maximal_trj = find_maxima_in_z(X_predicted_rec[range10,:])
-scatter!(maximal_trj[1:end-1], maximal_trj[2:end], color = :red)
-
-
-
-
