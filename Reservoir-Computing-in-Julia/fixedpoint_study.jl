@@ -47,9 +47,15 @@ epochs = 400
 batchsize = 256
 learning_rate = 1e-3
 noise_level = 0.02f0
-K_sub = 50                  # RK2 substeps per dt; the closed-loop valid time is
+K_sub = 50                  # substeps per dt; the closed-loop valid time is
                             # flat from K_sub=20..200 (see convergence check),
                             # so 50 is well converged and 4x faster than 200
+method = :imex              # :rk2  -> explicit midpoint (previous study)
+                            # :imex -> linear-implicit: the stiff linear part
+                            #   (coupling + recovery) is solved implicitly with a
+                            #   constant, pre-inverted operator Minv (just another
+                            #   weight matrix on an FPGA); the per-node cubic is
+                            #   the only term left explicit. A-stable.
 bit_widths = [4, 6, 8, 10, 12, 14, 16, 24]
 
 rng = MersenneTwister(SEED)
@@ -147,6 +153,20 @@ function closed_loop(bits::Int, ranges; record = false, ksub::Int = K_sub)
     W1_q  = fxq(W1, bits, ranges.w1); b1_q = fxq(b1, bits, ranges.w1)
     W2_q  = fxq(W2, bits, ranges.w2); b2_q = fxq(b2, bits, ranges.w2)
 
+    # IMEX operator: the linear part L acts on s = [u; w] as
+    #   du_lin = speed*((Wc - diag(in_strength) + I)*u - w),  dw_lin = speed*eps*u
+    # (I - dt_sub*L) s_new = s + dt_sub*(forcing(gin) + cubic(u_old)).
+    # M is constant, so Minv is precomputed in full precision and then stored
+    # quantized -- on an FPGA it is just another weight matrix for the matvec.
+    Minv_q = zeros(2N, 2N)
+    if method === :imex
+        L = zeros(2N, 2N)
+        L[1:N, 1:N] = speed * (Wc - Diagonal(in_strength) + I)
+        L[1:N, (N + 1):2N] = -speed * Matrix(I, N, N)
+        L[(N + 1):2N, 1:N] = speed * eps_fhn * Matrix(I, N, N)
+        Minv_q = fxq(inv(Matrix(I, 2N, 2N) - dt_sub * L), bits, ranges.minv)
+    end
+
     n_steps = length(t_test)
     pred = zeros(n_steps, dim_system)
     obs = Dict(:u => 0.0, :w => 0.0, :g => 0.0, :h => 0.0, :fb => 0.0)
@@ -154,23 +174,31 @@ function closed_loop(bits::Int, ranges; record = false, ksub::Int = K_sub)
     state = fxq(R_train[:, end], bits, ranges.u)
     x = fxq(u_train[end, :], bits, ranges.fb)
 
-    # FHN derivative for the (quantized) reservoir; intermediate accumulators
-    # are full precision, results are quantized at the register write.
+    # explicit FHN derivative (used by :rk2); accumulators full precision,
+    # results quantized at the register write.
     deriv(u, w, gin) = (speed .* (Wc_q * u .- in_strength .* u .+ u .- u .^ 3 ./ 3 .- w .+ gin),
                         speed * eps_fhn .* (R0 .* gin .+ u .- a_fhn))
 
     for i in 1:n_steps
         gin = fxq(Win_q * x, bits, ranges.g)
+        # forcing constant over the substeps (zero-order-hold input)
+        forcing = vcat(speed .* gin, speed * eps_fhn .* (R0 .* gin .- a_fhn))
         for _ in 1:ksub
             u = @view state[1:N]; w = @view state[(N + 1):2N]
-            # RK2 (midpoint): 2nd-order, stable, cheap for an FPGA integrator
-            du1, dw1 = deriv(u, w, gin)
-            um = u .+ (dt_sub / 2) .* du1
-            wm = w .+ (dt_sub / 2) .* dw1
-            du2, dw2 = deriv(um, wm, gin)
-            unew = fxq(u .+ dt_sub .* du2, bits, ranges.u)
-            wnew = fxq(w .+ dt_sub .* dw2, bits, ranges.u)
-            state = vcat(unew, wnew)
+            if method === :imex
+                # linear-implicit: only the cubic is explicit
+                rhs = state .+ dt_sub .* (forcing .+ vcat(-speed .* u .^ 3 ./ 3, zeros(N)))
+                state = fxq(Minv_q * rhs, bits, ranges.u)
+            else
+                # RK2 (midpoint): 2nd-order explicit
+                du1, dw1 = deriv(u, w, gin)
+                um = u .+ (dt_sub / 2) .* du1
+                wm = w .+ (dt_sub / 2) .* dw1
+                du2, dw2 = deriv(um, wm, gin)
+                unew = fxq(u .+ dt_sub .* du2, bits, ranges.u)
+                wnew = fxq(w .+ dt_sub .* dw2, bits, ranges.u)
+                state = vcat(unew, wnew)
+            end
         end
         hist = hcat(hist[:, 2:end], state)
         feats = vcat(hist[:, end], hist[:, end - d_steps], hist[:, end - 2d_steps])
@@ -190,7 +218,7 @@ end
 
 # --- check that the fixed-step Float64 loop converges to the Tsit5 1.57 ------
 # (separates the integration-scheme penalty from the quantization penalty)
-seed_ranges = (u = 12.0, w = 12.0, g = 30.0, h = 1.0, fb = 5.0,
+seed_ranges = (u = 12.0, w = 12.0, g = 30.0, h = 1.0, fb = 5.0, minv = 5.0,
                wc = maximum(abs, Wc), win = maximum(abs, W_in),
                w1 = max(maximum(abs, W1), maximum(abs, b1)),
                w2 = max(maximum(abs, W2), maximum(abs, b2)))
@@ -210,7 +238,14 @@ end
 pred_float, obs = closed_loop(0, seed_ranges; record = true)
 state_range = 1.2 * maximum(abs, R_train)
 input_range = 1.2 * maximum(abs, G_train)
+# calibrate the implicit-operator range from the actual Minv
+L0 = zeros(2N, 2N)
+L0[1:N, 1:N] = speed * (Wc - Diagonal(in_strength) + I)
+L0[1:N, (N + 1):2N] = -speed * Matrix(I, N, N)
+L0[(N + 1):2N, 1:N] = speed * eps_fhn * Matrix(I, N, N)
+minv_range = maximum(abs, inv(Matrix(I, 2N, 2N) - (dt / K_sub) * L0))
 ranges = (u = state_range, w = state_range, g = input_range, h = 1.0, fb = 5.0,
+          minv = minv_range,
           wc = seed_ranges.wc, win = seed_ranges.win,
           w1 = seed_ranges.w1, w2 = seed_ranges.w2)
 println("Operating ranges: state=±$(round(ranges.u, digits=2)) ",
@@ -219,8 +254,8 @@ println("Operating ranges: state=±$(round(ranges.u, digits=2)) ",
 
 X_float = inverse_transform(scaler, pred_float)
 tv_float, tvl_float = valid_prediction_time(test_data, X_float, t_test)
-println("Float64 RK2 baseline: $(round(tvl_float, digits = 2)) Lyapunov times ",
-        "(Tsit5 reference was 1.57)")
+println("Float64 $(method) baseline: $(round(tvl_float, digits = 2)) Lyapunov times ",
+        "(explicit RK2 fixed-step was 0.45, adaptive Tsit5 reference 1.57)")
 
 # --- sweep bit widths --------------------------------------------------------
 results = Tuple{Int, Float64}[]
@@ -238,13 +273,13 @@ end
 fig = Figure(size = (760, 520))
 ax = Axis(fig[1, 1], xlabel = "Word length (bits)",
           ylabel = "Valid prediction time (Lyapunov times)",
-          title = "FHN reservoir FPGA word-length study (grid, near-bifurcation)")
+          title = "FHN reservoir FPGA word-length study ($(method), grid, near-bifurcation)")
 hlines!(ax, [tvl_float], color = :gray, linestyle = :dash,
-        label = "Float64 RK2 baseline")
+        label = "Float64 $(method) baseline")
 scatterlines!(ax, first.(results), last.(results), color = :firebrick,
               markersize = 12, label = "fixed-point")
 axislegend(ax, position = :rb, framevisible = false)
-save("figures/fixedpoint_validtime_vs_bits.png", fig)
+save("figures/fixedpoint_validtime_vs_bits_$(method).png", fig)
 
 # forecast at a low and a high bit width, vs truth
 let
@@ -258,8 +293,8 @@ let
             lines!(ax, t_test, preds[B][:, k], color = :red)
         end
     end
-    save("figures/fixedpoint_forecast_8_vs_12bit.png", fig2)
+    save("figures/fixedpoint_forecast_8_vs_12bit_$(method).png", fig2)
 end
 
-println("Figures: figures/fixedpoint_validtime_vs_bits.png, ",
-        "figures/fixedpoint_forecast_8_vs_12bit.png")
+println("Figures: figures/fixedpoint_validtime_vs_bits_$(method).png, ",
+        "figures/fixedpoint_forecast_8_vs_12bit_$(method).png")
