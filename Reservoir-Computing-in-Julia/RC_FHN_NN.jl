@@ -28,21 +28,33 @@ using CairoMakie
 # --- hyperparameters --------------------------------------------------------
 SEED = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 42
 # :erdos_renyi | :complete | :grid | :watts_strogatz | :barabasi_albert
-# Command line: julia ... RC_FHN_NN.jl [topology] [seed] [nofigs]
+# Command line: julia ... RC_FHN_NN.jl [topology] [seed] [nofigs] [ridge]
 # `nofigs` skips figure generation and the 100 s climate run (for seed sweeps).
+# `ridge` replaces the NN readout with ridge regression on [r; r^2], to
+# isolate whether the readout or the reservoir limits closed-loop skill.
 topology = isempty(ARGS) ? :erdos_renyi : Symbol(ARGS[1])
-save_figures = length(ARGS) < 3 || ARGS[3] != "nofigs"
-n_nodes = 64
+save_figures = !("nofigs" in ARGS)
+readout_kind = "ridge" in ARGS ? :ridge : :nn
+# ridge regularization, settable as e.g. `beta=1e-2` on the command line
+beta_arg = findfirst(a -> startswith(a, "beta="), ARGS)
+ridge_beta = beta_arg === nothing ? 1e-4 : parse(Float64, ARGS[beta_arg][6:end])
+n_nodes = 256
 dim_system = 3
 sigma_in = 1.5            # input scaling (data is standardized)
 washout = 500             # discard the first 5 s of reservoir transients
 dt = 0.01
+delay_steps = 10          # time-delay embedding: the readout sees
+                          # [r(t); r(t - tau); r(t - 2 tau)], tau = delay_steps*dt.
+                          # Triples the linear feature space without extra nodes.
 
 # FitzHugh-Nagumo parameters
 eps_fhn = 0.05            # time-scale separation
-a_lo, a_hi = 0.3, 0.7     # per-node threshold a_i ~ U(a_lo, a_hi); heterogeneity
-                          # breaks synchronization so nodes respond diversely
-coupling = 0.3            # global coupling strength
+a_lo, a_hi = 1.05, 1.3    # per-node threshold a_i ~ U(a_lo, a_hi). |a| > 1 puts
+                          # the nodes in the *excitable* (non-self-oscillating)
+                          # regime: quiescent without input, near-linear
+                          # sub-threshold response, and fading memory --
+                          # which makes the states far more linearly decodable
+coupling = 0.3            # total in-coupling per node (degree-normalized)
 R0 = 0.5                  # input coupling into the slow variable
 speed = 20.0              # global time-scale factor: matches the oscillator
                           # response time to the ~1 s Lorenz oscillations,
@@ -75,12 +87,17 @@ N = nv(g)
 println("Topology: $topology, $(N) nodes, $(ne(g)) directed edges, ",
         "density $(round(Graphs.density(g), digits = 3))")
 
-# Weighted coupling matrix: Wc[dst, src] = coupling * w_edge, with positive
-# random weights ("resistivities"), instead of the old deterministic
-# bell-shape-over-edge-index weights.
+# Weighted coupling matrix with positive random weights ("resistivities").
+# Each node's total in-coupling is normalized to `coupling`, so topology
+# comparisons are not confounded by degree differences (an unnormalized
+# dense graph over-couples and synchronizes the nodes).
 Wc = zeros(N, N)
 for e in edges(g)
-    Wc[dst(e), src(e)] = coupling * (0.1 + 0.9 * rand(rng))
+    Wc[dst(e), src(e)] = 0.1 + 0.9 * rand(rng)
+end
+for i in 1:N
+    s = sum(@view Wc[i, :])
+    s > 0 && (Wc[i, :] .*= coupling / s)
 end
 in_strength = vec(sum(Wc, dims = 2))   # for the diffusive coupling term
 
@@ -137,31 +154,57 @@ save_figures && let fig = Figure(size = (1000, 500))
     save("figures/RC_FHN_reservoir_states_$(topology).png", fig)
 end
 
-# --- NN readout: reservoir state at t_i -> Lorenz state at t_i ----------------------
-X_feat = Float32.(R_train[:, washout:end])
-Y_targ = Float32.(u_train[washout:end, :]')
+# --- delayed feature space -----------------------------------------------------------
+# Time-multiplexing: the readout operates on [r(t); r(t-tau); r(t-2tau)]
+# (6N features) rather than the instantaneous state (2N).
+const d_steps = delay_steps
+"Delayed feature columns for indices `idx` of state matrix `S` (needs idx .- 2d >= 1)."
+delay_features(S, idx) = vcat(S[:, idx], S[:, idx .- d_steps], S[:, idx .- 2d_steps])
 
-model = Chain(Dense(2N => 256, tanh), Dense(256 => dim_system))
-opt_state = Flux.setup(Adam(learning_rate), model)
-loader = Flux.DataLoader((X_feat, Y_targ); batchsize = batchsize, shuffle = true)
+n_tr = size(R_train, 2)
+F_train = delay_features(R_train, washout:n_tr)   # washout > 2*delay_steps
 
-for epoch in 1:epochs
-    epoch == round(Int, 0.75 * epochs) && Flux.adjust!(opt_state, 1e-4)
-    epoch_loss = 0.0
-    for (x, y) in loader
-        xn = x .+ noise_level .* randn(Float32, size(x))
-        loss, grads = Flux.withgradient(model) do m
-            Flux.mse(m(xn), y)
+# --- readout: delayed reservoir features at t_i -> Lorenz state at t_i -----------------
+# `readout` accepts a feature vector or a matrix of feature columns.
+if readout_kind === :ridge
+    # standardize the features so the ridge penalty acts uniformly; the raw
+    # excitable-FHN states have small, very unequal variances, which lets a
+    # tiny beta produce huge weights that do not generalize
+    f_mu = vec(mean(F_train, dims = 2))
+    f_sd = vec(std(F_train, dims = 2)) .+ 1e-8
+    Fs = (F_train .- f_mu) ./ f_sd
+    Phi = vcat(Fs, Fs .^ 2)
+    Y = u_train[washout:n_tr, :]
+    W_out = ((Phi * Phi' + ridge_beta * I) \ (Phi * Y))'
+    println("Ridge readout (beta = $ridge_beta) training MSE ",
+            "(standardized units): ", mean(abs2, W_out * Phi .- Y'))
+    readout(f) = (fs = (f .- f_mu) ./ f_sd; W_out * vcat(fs, fs .^ 2))
+else
+    X_feat = Float32.(F_train)
+    Y_targ = Float32.(u_train[washout:n_tr, :]')
+
+    model = Chain(Dense(6N => 256, tanh), Dense(256 => dim_system))
+    opt_state = Flux.setup(Adam(learning_rate), model)
+    loader = Flux.DataLoader((X_feat, Y_targ); batchsize = batchsize, shuffle = true)
+
+    for epoch in 1:epochs
+        epoch == round(Int, 0.75 * epochs) && Flux.adjust!(opt_state, 1e-4)
+        epoch_loss = 0.0
+        for (x, y) in loader
+            xn = x .+ noise_level .* randn(Float32, size(x))
+            loss, grads = Flux.withgradient(model) do m
+                Flux.mse(m(xn), y)
+            end
+            Flux.update!(opt_state, model, grads[1])
+            epoch_loss += loss / length(loader)
         end
-        Flux.update!(opt_state, model, grads[1])
-        epoch_loss += loss / length(loader)
+        epoch % 50 == 0 && println("Epoch $epoch, loss: $epoch_loss")
     end
-    epoch % 50 == 0 && println("Epoch $epoch, loss: $epoch_loss")
-end
-println("Final readout training MSE (standardized units): ",
-        Flux.mse(model(X_feat), Y_targ))
+    println("Final readout training MSE (standardized units): ",
+            Flux.mse(model(X_feat), Y_targ))
 
-readout(r) = Float64.(model(Float32.(r)))
+    readout(r) = Float64.(model(Float32.(r)))
+end
 
 # --- closed-loop (autonomous) forecast -----------------------------------------------
 # The predicted Lorenz state is fed back as the input current, held constant
@@ -175,11 +218,16 @@ function fhn_closed_loop_forecast(r_start, x_start, n_steps)
     integ = init(prob, Tsit5(); abstol = 1e-6, reltol = 1e-6,
                  save_everystep = false)
     pred = zeros(n_steps, dim_system)
+    # rolling buffer of the last 2*delay_steps+1 states (dt-spaced) for the
+    # delayed features; seeded from the end of the training run
+    hist = R_train[:, (end - 2d_steps):end]
     x = copy(x_start)
     for i in 1:n_steps
         g_ref[] = W_in * x
         step!(integ, dt, true)
-        x = clamp.(readout(integ.u), -5.0, 5.0)
+        hist = hcat(hist[:, 2:end], integ.u)
+        feats = vcat(hist[:, end], hist[:, end - d_steps], hist[:, end - 2d_steps])
+        x = clamp.(readout(feats), -5.0, 5.0)
         pred[i, :] = x
     end
     return pred
@@ -197,7 +245,11 @@ fhn_test! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input_test)
 prob_test = ODEProblem(fhn_test!, r_end, (t_test[1], t_test[end]))
 sol_test = solve(prob_test, Tsit5(); saveat = t_test,
                  abstol = 1e-6, reltol = 1e-6)
-pred_open_n = Float64.(model(Float32.(Array(sol_test))))'
+# prepend the training tail so the delayed features are defined from the
+# first test sample onward
+R_ext = hcat(R_train[:, (end - 2d_steps + 1):end], Array(sol_test))
+F_test = delay_features(R_ext, (2d_steps + 1):size(R_ext, 2))
+pred_open_n = readout(F_test)'
 X_pred_open = inverse_transform(scaler, Matrix(pred_open_n))
 
 # --- evaluation -------------------------------------------------------------------------
@@ -211,7 +263,9 @@ println("Closed-loop MSE over the first Lyapunov time: ", mse_1lyap)
 println("Open-loop (teacher-forced) MSE over the whole test set: ", mse_open)
 
 # machine-readable summary line for seed sweeps
-println("RESULT topology=$topology seed=$SEED t_valid_s=$(round(t_valid, digits = 3)) ",
+println("RESULT topology=$topology seed=$SEED readout=$readout_kind ",
+        readout_kind === :ridge ? "beta=$ridge_beta " : "",
+        "t_valid_s=$(round(t_valid, digits = 3)) ",
         "t_valid_lyap=$(round(t_valid_lyap, digits = 3)) mse_open=$(round(mse_open, digits = 4))")
 
 if save_figures
@@ -220,11 +274,11 @@ if save_figures
     X_climate = inverse_transform(scaler, pred_climate_n)
 
     # --- plots -----------------------------------------------------------------------------
-    suffix = String(topology)
+    suffix = readout_kind === :ridge ? "$(topology)_ridge" : String(topology)
     plot_forecast(t_test, test_data, X_pred_closed,
                   "figures/lorenz_FHN_NN_$(suffix).png";
                   pred_open_loop = X_pred_open, t_valid = t_valid,
-                  title = "FHN reservoir ($suffix) + NN readout " *
+                  title = "FHN reservoir ($suffix) + $(readout_kind) readout " *
                           "(closed-loop valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
     plot_forecast_3d(test_data, X_pred_closed,
                      "figures/lorenz3d_FHN_NN_$(suffix).png";
