@@ -27,7 +27,9 @@ using CairoMakie
 
 # --- hyperparameters --------------------------------------------------------
 const SEED = 42
-topology = :erdos_renyi   # :erdos_renyi | :complete | :grid | :watts_strogatz | :barabasi_albert
+# :erdos_renyi | :complete | :grid | :watts_strogatz | :barabasi_albert
+# can be passed on the command line: julia ... RC_FHN_NN.jl watts_strogatz
+topology = isempty(ARGS) ? :erdos_renyi : Symbol(ARGS[1])
 n_nodes = 64
 dim_system = 3
 sigma_in = 1.5            # input scaling (data is standardized)
@@ -130,7 +132,7 @@ let fig = Figure(size = (1000, 500))
         lines!(ax, t_train[1:n_show], R_train[i, 1:n_show], label = "node $i")
     end
     axislegend(ax, position = :rt, framevisible = false)
-    save("figures/RC_FHN_reservoir_states.png", fig)
+    save("figures/RC_FHN_reservoir_states_$(topology).png", fig)
 end
 
 # --- NN readout: reservoir state at t_i -> Lorenz state at t_i ----------------------
@@ -224,4 +226,4 @@ plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_FHN_NN_$(suffix).png"
 println("Figures written to figures/lorenz_FHN_NN_$(suffix).png, ",
         "figures/lorenz3d_FHN_NN_$(suffix).png, ",
         "figures/lorenz_map_FHN_NN_$(suffix).png, ",
-        "figures/RC_FHN_reservoir_states.png")
+        "figures/RC_FHN_reservoir_states_$(suffix).png")
