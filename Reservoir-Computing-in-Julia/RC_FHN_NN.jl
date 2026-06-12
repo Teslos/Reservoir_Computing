@@ -26,10 +26,12 @@ using Flux
 using CairoMakie
 
 # --- hyperparameters --------------------------------------------------------
-const SEED = 42
+SEED = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 42
 # :erdos_renyi | :complete | :grid | :watts_strogatz | :barabasi_albert
-# can be passed on the command line: julia ... RC_FHN_NN.jl watts_strogatz
+# Command line: julia ... RC_FHN_NN.jl [topology] [seed] [nofigs]
+# `nofigs` skips figure generation and the 100 s climate run (for seed sweeps).
 topology = isempty(ARGS) ? :erdos_renyi : Symbol(ARGS[1])
+save_figures = length(ARGS) < 3 || ARGS[3] != "nofigs"
 n_nodes = 64
 dim_system = 3
 sigma_in = 1.5            # input scaling (data is standardized)
@@ -124,7 +126,7 @@ sol_train = solve(prob_train, Tsit5(); saveat = t_train,
 R_train = Array(sol_train)                      # 2N x n_train, [u; w] per column
 
 # plot a few oscillator traces to inspect the reservoir dynamics
-let fig = Figure(size = (1000, 500))
+save_figures && let fig = Figure(size = (1000, 500))
     ax = Axis(fig[1, 1], xlabel = "Time (s)", ylabel = "u",
               title = "FitzHugh-Nagumo reservoir, first 8 oscillators (first 20 s)")
     n_show = round(Int, 20.0 / dt)
@@ -208,22 +210,28 @@ println("Closed-loop valid prediction time: $(round(t_valid, digits = 2)) s ",
 println("Closed-loop MSE over the first Lyapunov time: ", mse_1lyap)
 println("Open-loop (teacher-forced) MSE over the whole test set: ", mse_open)
 
-# --- long autonomous run for the attractor climate ----------------------------------------
-pred_climate_n = fhn_closed_loop_forecast(r_end, x_end, round(Int, 100.0 / dt))
-X_climate = inverse_transform(scaler, pred_climate_n)
+# machine-readable summary line for seed sweeps
+println("RESULT topology=$topology seed=$SEED t_valid_s=$(round(t_valid, digits = 3)) ",
+        "t_valid_lyap=$(round(t_valid_lyap, digits = 3)) mse_open=$(round(mse_open, digits = 4))")
 
-# --- plots ----------------------------------------------------------------------------------
-suffix = String(topology)
-plot_forecast(t_test, test_data, X_pred_closed,
-              "figures/lorenz_FHN_NN_$(suffix).png";
-              pred_open_loop = X_pred_open, t_valid = t_valid,
-              title = "FHN reservoir ($suffix) + NN readout " *
-                      "(closed-loop valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
-plot_forecast_3d(test_data, X_pred_closed,
-                 "figures/lorenz3d_FHN_NN_$(suffix).png";
-                 title = "FHN reservoir ($suffix): closed-loop forecast")
-plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_FHN_NN_$(suffix).png")
-println("Figures written to figures/lorenz_FHN_NN_$(suffix).png, ",
-        "figures/lorenz3d_FHN_NN_$(suffix).png, ",
-        "figures/lorenz_map_FHN_NN_$(suffix).png, ",
-        "figures/RC_FHN_reservoir_states_$(suffix).png")
+if save_figures
+    # --- long autonomous run for the attractor climate ------------------------------------
+    pred_climate_n = fhn_closed_loop_forecast(r_end, x_end, round(Int, 100.0 / dt))
+    X_climate = inverse_transform(scaler, pred_climate_n)
+
+    # --- plots -----------------------------------------------------------------------------
+    suffix = String(topology)
+    plot_forecast(t_test, test_data, X_pred_closed,
+                  "figures/lorenz_FHN_NN_$(suffix).png";
+                  pred_open_loop = X_pred_open, t_valid = t_valid,
+                  title = "FHN reservoir ($suffix) + NN readout " *
+                          "(closed-loop valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
+    plot_forecast_3d(test_data, X_pred_closed,
+                     "figures/lorenz3d_FHN_NN_$(suffix).png";
+                     title = "FHN reservoir ($suffix): closed-loop forecast")
+    plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_FHN_NN_$(suffix).png")
+    println("Figures written to figures/lorenz_FHN_NN_$(suffix).png, ",
+            "figures/lorenz3d_FHN_NN_$(suffix).png, ",
+            "figures/lorenz_map_FHN_NN_$(suffix).png, ",
+            "figures/RC_FHN_reservoir_states_$(suffix).png")
+end
