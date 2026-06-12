@@ -1,438 +1,227 @@
-using OrdinaryDiffEq
-using LinearAlgebra
-using NNlib: swish
+# A network of FitzHugh-Nagumo oscillators used as a *physical* reservoir to
+# forecast the chaotic Lorenz-63 system, with a neural-network readout.
+#
+# Differences from the previous version of this script:
+#   * The network ODE is written directly with a weighted adjacency matrix
+#     instead of NetworkDynamics v0.8 (whose vertex callback here silently
+#     used only 2 of each node's incident edges via `e_s, e_d = edges`).
+#   * The forecast is genuinely closed-loop: the readout's prediction is fed
+#     back as the reservoir input. Previously the reservoir was driven by
+#     splines of the *true test data* during "prediction" (teacher forcing),
+#     which made the results look far better than a real forecast.
+#   * A teacher-forced (open-loop) one-step prediction is still computed, but
+#     it is plotted dashed and labeled as such.
+#   * Seeded RNG, standardized data, washout, no dead code, CPU-only Flux.
+#
+# Run from the repo root:  julia +1.11 --project=. Reservoir-Computing-in-Julia/RC_FHN_NN.jl
+
+include("common.jl")
+using .RCCommon
 using Graphs
-using NetworkDynamics
-using Distributions
-using Interpolations
-using Dierckx
-
-
-# graph creation 
-function create_barabasi_albert_graph(N::Int=5, k::Int=2)
-    g = barabasi_albert(N, k, is_directed=true)
-    edge_weights = ones(length(edges(g)))
-    g_weighted = SimpleDiGraph(g)
-    g_directed = SimpleDiGraph(g_weighted)
-    return g_directed, edge_weights
-end
-# create the grid graph
-function create_graph(N::Int=8, M::Int=8)
-    g = Graphs.grid([N, M])
-    edge_weights = ones(length(edges(g)))
-    g_weighted = SimpleDiGraph(g)
-    g_directed = SimpleDiGraph(g_weighted)
-    return g_directed, edge_weights
-end
-# create erdos-renyi graph
-function create_erdos_renyi_graph(N::Int64, prob::Float64)
-    g = erdos_renyi(N, prob)
-    edge_weights = ones(length(edges(g)))
-    g_weighted = SimpleDiGraph(g)
-    g_directed = SimpleDiGraph(g_weighted)
-    return g_directed, edge_weights
-end
-function create_watts_strogatz_graph(N::Int=5, k::Int=2, p::Float64=0.5)
-    g = watts_strogatz(N, k, p)
-    edge_weights = ones(length(edges(g)))
-    g_weighted = SimpleDiGraph(g)
-    g_directed = SimpleDiGraph(g_weighted)
-    return g_directed, edge_weights
-end
-
-function create_complete_graph(N::Int=5)
-    # create all to all graph
-    g = Graphs.complete_graph(N)
-    edge_weights = ones(length(edges(g)))
-    g_weighted = SimpleDiGraph(g)
-    g_directed = SimpleDiGraph(g_weighted)
-    return g_directed, edge_weights
-end
-
-function generate_reservoir(dim_reservoir, density)
-    A = rand(dim_reservoir, dim_reservoir)
-    A = A .< density
-    ran = 2*(rand(dim_reservoir, dim_reservoir) .- 0.5)
-    A = A.*ran
-    # get eigenvalues of A
-    eigA = eigvals(A)
-    # set spectral radius of A to 1
-    A = A./maximum(abs.(eigA))
-    return A
-end
-
-# generate the training data
-function lorenz!(dx, x, p, t)
-    sigma, rho, beta = p
-    dx[1] = sigma*(x[2] - x[1])
-    dx[2] = x[1]*(rho - x[3]) - x[2]
-    dx[3] = x[1]*x[2] - beta*x[3]
-end
-
-# find maxima in z-coord of trajectory
-function find_maxima_in_z(trj::AbstractMatrix{<:Real})
-    z = trj[:, 3]              # extract the z-column
-    z_left   = z[1:end-2]      # z[1], …, z[N-2]
-    z_center = z[2:end-1]      # z[2], …, z[N-1]
-    z_right  = z[3:end]        # z[3], …, z[N]
-
-    is_max = (z_center .> z_left) .& (z_center .> z_right)
-    return z_center[is_max]
-end
-
-# create graph 
-#g_directed, edge_weights = create_complete_graph(8*8)
-#g_directed, edge_weights = create_barabasi_albert_graph(8*8, 12)
-#g_directed, edge_weights = create_graph(8, 8)
-#g_directed, edge_weights = create_watts_strogatz_graph(8*8, 32, 0.25)
-g_directed, edge_weights = create_erdos_renyi_graph(8*8, 0.1)
-
-println("Number of nodes: ", nv(g_directed))
-println("Number of edges: ", size(edge_weights))
-println("Density of graph: ", Graphs.density(g_directed))
-
-# generate the network
-@inline Base.@propagate_inbounds function fhn_electrical_vertex_simple!(dv, v, edges, p, t)
-    g = p
-    e_s, e_d = edges
-    dv[1] = g(t) + v[1] - v[1]^3 / 3 - v[2]
-    dv[2] = (g(t) .* R0 + v[1] - a) * ϵ
-    for e in e_s
-        dv[1] -= e[1]
-    end
-    for e in e_d
-        dv[1] += e[1]
-    end
-    nothing
-end
-
-@inline Base.@propagate_inbounds function electrical_edge_simple!(e, v_s, v_d, p, t)
-    e[1] =  p * (v_s[1] - v_d[1]) # * σ
-    nothing
-end
-
-Base.@propagate_inbounds function fhn_electrical_vertex!(dv, v, edges, p, t)
-    # add external input j0
-    g = p
-
-    #println("g size:",size(g))
-    #println("g type:",typeof(g))
-    # adding external input current
-    if t < 0.5
-        dv[1] = (v[1] + v[1]^3/3 - v[2])
-    else
-        dv[1] = (g[t] + v[1] - v[1]^3/3 - v[2])
-    end
-    # adding the external input voltage
-    if t < 0.5
-        dv[2] = (v[1] + a)*ϵ
-    else
-        dv[2] = R0 .* g[t] + (v[1] + a)*ϵ
-    end
-    
-    for e in edges
-        dv[1] += e[1]
-        dv[2] += e[2]
-    end
-    nothing
-end
-
-Base.@propagate_inbounds function fhn_electrical_vertex_win!(dv, v, edges, p, t)
-    # add external input j0
-    w = p
-
-    #println("g size:",size(g))
-    #println("g type:",typeof(g))
-    # adding external input current
-    if t < 300
-        dv[1] = (v[1] - v[1]^3/3 - v[2]) * 1/ϵ
-    else
-        dv[1] = (g[t] + v[1] - v[1]^3/3 - v[2]) * 1/ϵ
-    end
-    # adding the external input voltage
-    if t < 300
-        dv[2] = v[1] + a
-    else
-        dv[2] = R0 .* g[t] + v[1] + a
-    end
-    
-    for e in edges
-        dv[1] += e[1]
-        dv[2] += e[2]
-    end
-    nothing
-end
-# set the B rotational matrix with an angle ϕ,
-# the default value is ϕ = π/2 - 0.1, but the value causes the numerics to be unstable
-ϕ = π/2 - 0.1
-B = [cos(ϕ) sin(ϕ); -sin(ϕ) cos(ϕ)]
-#B = [0.25 0.25; -0.25 0.25]
-Base.Base.@propagate_inbounds function electrical_edge!(e, v_s, v_d, p, t)
-    #println("p type:",typeof(p))
-    #println("v_s size:",size(v_s))
-    #println("v_d size:",size(v_d))
-    e[1] = p*(B[1,1]*(v_s[1] - v_d[1]) + B[1,2]*(v_s[2] - v_d[2])) # *σ  - edge coupling for current
-    e[2] = p*(B[2,1]*(v_s[1] - v_d[1]) + B[2,2]*(v_s[2] - v_d[2])) # *σ  - edge coupling for voltage
-    nothing
-end
-
-
-odeelevertex = ODEVertex(; f=fhn_electrical_vertex_simple!, dim=2, sym=[:u, :v])
-odeeleedge = StaticEdge(; f=electrical_edge_simple!, dim=2, coupling=:directed)
-
-fhn_network! = network_dynamics(odeelevertex, odeeleedge, g_directed)
-
-
-
-# generate the training data for lorenz system
-u0 = [10;10;10]
-tspan = (0.0, 300.0)
-dt = 0.01
-p = (10.0, 28.0, 8/3) # sigma, rho, beta values
-prob = ODEProblem(lorenz!, u0, tspan, p)
-sol  = solve(prob, Tsit5(), saveat = dt, progress = true)
-train_data = hcat(sol.u...)'
-tlorenz = sol.t
-
-# generate the test data
-IC_validate = [10.1; 10.0; 10.0]
-tspan2 = (0.0, 50.0)
-prob2 = ODEProblem(lorenz!, IC_validate, tspan2, p)
-sol2 = solve(prob2, Tsit5(), saveat = dt, progress = true)
-test_data = hcat(sol2.u...)'
-t2 = sol2.t
-
-dim_system = 3
-dim_reservoir = 2* nv(g_directed) # 2 times the number of nodes in the network
-
-sigma = 0.1 # input scaling
-density = 0.05 # density of the reservoir
-beta = 0.01 # regularization parameter
-
-r_state = zeros(dim_reservoir)
-A = generate_reservoir(dim_reservoir, density)
-W_in = 2*sigma*(rand(dim_reservoir, dim_system) .- 0.5)
-
-W_out = zeros(dim_system, dim_reservoir)
-R = zeros(dim_reservoir, length(tlorenz))
-
-# Parameter handling
-N = nv(g_directed) # Number of nodes in the network
-const ϵ = 0.05 # time scale separation parameter, default value is 0.05
-const a = 0.5 # threshold parameter abs(a) < 1 is self-sustained limit cycle, abs(a) = 1 is a Hopf bifurcation
-const σ = 0.006 # coupling strength
-const R0 = 0.5
-# different weights for edges, because the resitivity of the edges are always positive
-w_ij = [pdf(Normal(), x) for x in range(-1, 1, length=ne(g_directed))]
-gs = [Spline1D(tlorenz, (W_in*train_data')[i,:], k=2) for i in 1:nv(g_directed)]
-# Tuple of parameters for nodes and edges
-p = (gs,σ * w_ij)
-#Initial conditions
-x0 = W_in*u0
-
-# Solving the ODE
-using OrdinaryDiffEq
-
-tspan = (0.0, 300.0)
-datasize = length(tlorenz)
-tsteps = range(tspan[1], tspan[2], length=datasize)
-prob = ODEProblem(fhn_network!, x0, tspan, p)
-sol = solve(prob, Tsit5(), saveat=tsteps)
-
-using GLMakie
-fig = Figure()
-ax = GLMakie.Axis(fig[1, 1], xlabel = "Time", ylabel = "u", title = "FitzHugh-Nagumo network")
-t= sol.t
-u = sol[:,:]
-# use only the u values
-diff_data = u
-for i in 1:64
-    lines!(ax, t, u[i,:], label="Oscillator $i")
-    #GLMakie.heatmap!(ax, t, i*ones(length(t)), sol[i,:], colormap = :viridis)
-    #text!(ax, t[end], u[i,end]+0.1, text=string("Oscillator ", i), align=(:right, :center))
-end
-#axislegend(ax, position = :rt)
-fig
-GLMakie.save("RC_FHN_NN.png", fig)
-
-# instead of ridge regression, we can use neural network to fit the output weights
-using Flux
-using Lux
-using LuxCUDA
-using Flux: crossentropy, onecold, onehotbatch, params, mse
-using Flux: DataLoader
-using Statistics: mean
+using LinearAlgebra
 using Random
-using Optimisers
-using MLDataUtils
-using Zygote
+using Statistics
+using OrdinaryDiffEq
+using Flux
+using CairoMakie
 
-#=
-# using the neural network to fit output weights
-const dev = gpu_device()
-const dev_cpu = cpu_device()
-model = Lux.Chain(Lux.Dense(64, 100, swish), Lux.Dense(100, dim_system))
-rng = Random.default_rng()
-nn_rc, st_rc = Lux.setup(rng, model) |> dev
+# --- hyperparameters --------------------------------------------------------
+const SEED = 42
+topology = :erdos_renyi   # :erdos_renyi | :complete | :grid | :watts_strogatz | :barabasi_albert
+n_nodes = 64
+dim_system = 3
+sigma_in = 1.5            # input scaling (data is standardized)
+washout = 500             # discard the first 5 s of reservoir transients
+dt = 0.01
 
-function loss(x, y, model, ps, st)
-    pred, st = model(x, ps, st)
-    loss = sum((pred .- y).^2)
-    return loss, st
+# FitzHugh-Nagumo parameters
+eps_fhn = 0.05            # time-scale separation
+a_lo, a_hi = 0.3, 0.7     # per-node threshold a_i ~ U(a_lo, a_hi); heterogeneity
+                          # breaks synchronization so nodes respond diversely
+coupling = 0.3            # global coupling strength
+R0 = 0.5                  # input coupling into the slow variable
+speed = 20.0              # global time-scale factor: matches the oscillator
+                          # response time to the ~1 s Lorenz oscillations,
+                          # without it the nodes only low-pass the input
+
+# readout training
+epochs = 400
+batchsize = 256
+learning_rate = 1e-3
+noise_level = 0.02f0    # noise injected into reservoir states during training;
+                        # stabilizes the closed loop against its own feedback errors
+
+rng = MersenneTwister(SEED)
+Random.seed!(SEED)
+mkpath("figures")
+
+# --- graph topology -----------------------------------------------------------
+function build_graph(kind::Symbol, n::Int, rng::AbstractRNG)
+    g = kind === :erdos_renyi    ? erdos_renyi(n, 0.1; rng = rng) :
+        kind === :complete       ? complete_graph(n) :
+        kind === :grid           ? Graphs.grid([isqrt(n), isqrt(n)]) :
+        kind === :watts_strogatz ? watts_strogatz(n, 8, 0.25; rng = rng) :
+        kind === :barabasi_albert ? barabasi_albert(n, 4; rng = rng) :
+        error("unknown topology $kind")
+    return SimpleDiGraph(g)   # undirected edges become directed pairs
 end
-loss_function(ps, st, x, y) = loss(x, y, model, ps, st)
 
-function train_model(model, ps, st, train_data, epochs=10000, batch_size=1024, learning_rate=0.001)
-    loss_history = []
-    loss_value = 0.0
-    opt = ADAM(learning_rate)
-    st_opt = Optimisers.setup(opt, st)
-    train_dataloader = DataLoader(train_data, batchsize=batch_size, shuffle=true) |> dev
-    for epoch in 1:epochs
-        for (x,y) in train_dataloader
-            (loss_value, st), back = Zygote.pullback(loss, x, y, model, ps, st)
-            grads = back((one(loss_value),nothing))[4]
-            st_opt, ps = Optimisers.update(st_opt, ps, grads)
+g = build_graph(topology, n_nodes, rng)
+N = nv(g)
+println("Topology: $topology, $(N) nodes, $(ne(g)) directed edges, ",
+        "density $(round(Graphs.density(g), digits = 3))")
 
-            push!(loss_history, loss_value)
-        end
-        if epoch % 100 == 0
-            println("Epoch $epoch, Loss: $loss_value")
-        end
+# Weighted coupling matrix: Wc[dst, src] = coupling * w_edge, with positive
+# random weights ("resistivities"), instead of the old deterministic
+# bell-shape-over-edge-index weights.
+Wc = zeros(N, N)
+for e in edges(g)
+    Wc[dst(e), src(e)] = coupling * (0.1 + 0.9 * rand(rng))
+end
+in_strength = vec(sum(Wc, dims = 2))   # for the diffusive coupling term
+
+# --- FHN network reservoir ------------------------------------------------------
+# State r = [u; w].  For node i (a_i heterogeneous, `speed` rescales time):
+#   du_i = speed * (u_i - u_i^3/3 - w_i + g_i(t) + sum_j Wc[i,j] (u_j - u_i))
+#   dw_i = speed * eps * (R0 g_i(t) + u_i - a_i)
+# `input` is a closure returning the N-vector g(t).
+function make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input)
+    n = length(in_strength)
+    return function fhn!(dr, r, p, t)
+        u = @view r[1:n]
+        w = @view r[(n + 1):end]
+        du = @view dr[1:n]
+        dw = @view dr[(n + 1):end]
+        gin = input(t)
+        mul!(du, Wc, u)
+        @. du = speed * (du - in_strength * u + u - u^3 / 3 - w + gin)
+        @. dw = speed * eps_fhn * (R0 * gin + u - a_fhn)
+        return nothing
     end
-    return ps, st
 end
 
-ps, st = Lux.setup(rng, model) |> dev
-data = (u, train_data')
-ps, st = train_model(model, ps, st, data)
+# --- data ------------------------------------------------------------------------
+train_data, t_train, test_data, t_test =
+    generate_lorenz_split(t_train = 200.0, t_test = 25.0, dt = dt)
+scaler = Standardizer(train_data)
+u_train = transform(scaler, train_data)
+u_test = transform(scaler, test_data)
 
+W_in = 2 * sigma_in * (rand(rng, N, dim_system) .- 0.5)
+a_fhn = a_lo .+ (a_hi - a_lo) .* rand(rng, N)   # heterogeneous node thresholds
 
-println("Final Loss: ", loss(dev(u), dev(train_data'), model, ps, st)[1])
-=# 
+# --- drive the reservoir with the training signal (teacher forcing) ---------------
+G_train = W_in * u_train'                       # N x n_train input currents
+input_train = make_lerp(t_train, G_train)
+fhn_train! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input_train)
 
-using FluxOptTools
-using Optim 
-# using the neural network to fit output weights
-model = Flux.Chain(Flux.Dense(dim_reservoir, 256, swish), Flux.Dense(256, dim_system))
-loss(model) = mean(abs2, model(u) .- train_data')
-opt = Flux.Adam(0.01)
-Zygote.refresh()
-ps = Flux.params(model)
-lossfun, gradfun, fg!, p0 = optfuns(()->loss(model), ps)
-res = Optim.optimize(Optim.only_fg!(fg!), p0, BFGS(), Optim.Options(iterations=1000, store_trace=true))
-#data = [(u, train_data)]
-#Flux.train!(loss, params(model), data, opt)
+r0 = zeros(2N)
+prob_train = ODEProblem(fhn_train!, r0, (t_train[1], t_train[end]))
+sol_train = solve(prob_train, Tsit5(); saveat = t_train,
+                  abstol = 1e-6, reltol = 1e-6)
+R_train = Array(sol_train)                      # 2N x n_train, [u; w] per column
 
-
-# final Loss
-println("Final Loss: ", loss(model))
-R_test = zeros(dim_reservoir, length(t2))
-# get prediction of the model for test data
-#r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*IC_validate)))
-ut = W_in*IC_validate
-gs = [Spline1D(t2, (W_in*test_data')[i,:], k=2) for i in 1:nv(g_directed)]
-p = (gs,σ * w_ij)
-prob2 = remake(prob, u0=ut, tspan=tspan2, p=p)
-sol2 = solve(prob2, Tsit5(), saveat=t2)
-r_test = sol2[:,:]
-# plot the r_test
-fig = Figure()
-ax = GLMakie.Axis(fig[1, 1], xlabel = "Time", ylabel = "u", title = "FitzHugh-Nagumo network")
-for i in 1:64
-    lines!(ax, t2, r_test[i,:], label="Oscillator $i")
-    #text!(ax, t[end], u[i,end]+0.1, text=string("Oscillator ", i), align=(:right, :center))
+# plot a few oscillator traces to inspect the reservoir dynamics
+let fig = Figure(size = (1000, 500))
+    ax = Axis(fig[1, 1], xlabel = "Time (s)", ylabel = "u",
+              title = "FitzHugh-Nagumo reservoir, first 8 oscillators (first 20 s)")
+    n_show = round(Int, 20.0 / dt)
+    for i in 1:8
+        lines!(ax, t_train[1:n_show], R_train[i, 1:n_show], label = "node $i")
+    end
+    axislegend(ax, position = :rt, framevisible = false)
+    save("figures/RC_FHN_reservoir_states.png", fig)
 end
-fig
-r_state = zeros(128)
-X_predicted = zeros(dim_system, length(t2))
-X_predicted_rec = zeros(Float32, dim_system, length(t2))
-res_sol = solve(prob2, Tsit5(), u0=W_in*IC_validate, tspan=(t2[1], t2[2]))
-r_state = Array(res_sol[:,end])
-r_state = W_in * IC_validate # initial state of the reservoir
-#X_predicted_rec[:,1] = model(swish.(r_state)) # Wout * rstate
-for t in 1:length(t2)-1
-    X_predict = model(r_state) # Wout * rstate
-    res_sol = solve(prob2, Tsit5(), u0=r_state, tspan=(t2[t], t2[t+1]))
-    X_predicted_rec[:,t] = X_predict
-    
-    r_state = res_sol[:,end]
+
+# --- NN readout: reservoir state at t_i -> Lorenz state at t_i ----------------------
+X_feat = Float32.(R_train[:, washout:end])
+Y_targ = Float32.(u_train[washout:end, :]')
+
+model = Chain(Dense(2N => 256, tanh), Dense(256 => dim_system))
+opt_state = Flux.setup(Adam(learning_rate), model)
+loader = Flux.DataLoader((X_feat, Y_targ); batchsize = batchsize, shuffle = true)
+
+for epoch in 1:epochs
+    epoch == round(Int, 0.75 * epochs) && Flux.adjust!(opt_state, 1e-4)
+    epoch_loss = 0.0
+    for (x, y) in loader
+        xn = x .+ noise_level .* randn(Float32, size(x))
+        loss, grads = Flux.withgradient(model) do m
+            Flux.mse(m(xn), y)
+        end
+        Flux.update!(opt_state, model, grads[1])
+        epoch_loss += loss / length(loader)
+    end
+    epoch % 50 == 0 && println("Epoch $epoch, loss: $epoch_loss")
 end
-# predict the Lorenz system from the reservoir
-X_predicted = model(r_test)
+println("Final readout training MSE (standardized units): ",
+        Flux.mse(model(X_feat), Y_targ))
 
+readout(r) = Float64.(model(Float32.(r)))
 
-#X_predicted = dev_cpu(Lux.apply(model, dev(R_test), ps, st)[1])
-#X_predicted = model(R_test)
-# X_predicted = X_train'
-X_predicted = X_predicted'
-X_predicted_rec = X_predicted_rec'
-# using the ridge regression to fit output weights
-#W_out = (train_data'*R')*inv( (R*R') + beta * I(dim_reservoir) )
-
-#=
-
-r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*IC_validate)))
-
-for i in 1:length(t2)
-    predict = model(r_state)
-    X_predicted[i,:] = predict'
-    #r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*X_predicted[i,:])))
-    #r_state = 1.0 .+ tanh.(A*r_state + W_in*X_predicted[i,:])
-    r_state = swish.(A*r_state + W_in*X_predicted[i,:])
+# --- closed-loop (autonomous) forecast -----------------------------------------------
+# The predicted Lorenz state is fed back as the input current, held constant
+# over each dt step (zero-order hold). The truth is never used. Predictions
+# are clamped to +-5 standardized units so a diverging forecast cannot blow
+# up the cubic FHN nonlinearity.
+function fhn_closed_loop_forecast(r_start, x_start, n_steps)
+    g_ref = Ref(zeros(N))
+    fhn_cl! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, t -> g_ref[])
+    prob = ODEProblem(fhn_cl!, copy(r_start), (0.0, n_steps * dt))
+    integ = init(prob, Tsit5(); abstol = 1e-6, reltol = 1e-6,
+                 save_everystep = false)
+    pred = zeros(n_steps, dim_system)
+    x = copy(x_start)
+    for i in 1:n_steps
+        g_ref[] = W_in * x
+        step!(integ, dt, true)
+        x = clamp.(readout(integ.u), -5.0, 5.0)
+        pred[i, :] = x
+    end
+    return pred
 end
-=#
-# mean squared error
-MSE = sum((test_data .- X_predicted).^2)/length(t2)
-MSE_rec = sum((test_data[1:50,:] .- X_predicted_rec[1:50,:]).^2)/50
-# plot the results
-using GLMakie
 
-fig = Figure()
-ax1 = Axis(fig[1, 1], ylabel = "x")
-ax2 = Axis(fig[2, 1], ylabel = "y")
-ax3 = Axis(fig[3, 1], ylabel = "z", xlabel = "Time")
-xlims!(ax1, t2[1], 50.0)
-xlims!(ax2, t2[1], 50.0)
-xlims!(ax3, t2[1], 50.0)
-lines!(ax1, t2, test_data[:,1], color = :blue)
-lines!(ax1, t2, X_predicted_rec[1:length(t2),1], color = :red)
+r_end = R_train[:, end]                  # synchronized state at the end of training
+x_end = u_train[end, :]                  # last known true state (standardized)
+pred_closed_n = fhn_closed_loop_forecast(r_end, x_end, length(t_test))
+X_pred_closed = inverse_transform(scaler, pred_closed_n)
 
-lines!(ax2, t2, test_data[:,2], color = :green)
-lines!(ax2, t2, X_predicted_rec[1:length(t2),2], color = :orange)
+# --- open-loop (teacher-forced) one-step prediction, for comparison only --------------
+G_test = W_in * u_test'
+input_test = make_lerp(t_test, G_test)
+fhn_test! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input_test)
+prob_test = ODEProblem(fhn_test!, r_end, (t_test[1], t_test[end]))
+sol_test = solve(prob_test, Tsit5(); saveat = t_test,
+                 abstol = 1e-6, reltol = 1e-6)
+pred_open_n = Float64.(model(Float32.(Array(sol_test))))'
+X_pred_open = inverse_transform(scaler, Matrix(pred_open_n))
 
-lines!(ax3, t2, test_data[:,3], color = :purple)
-lines!(ax3, t2, X_predicted_rec[1:length(t2),3], color = :cyan)
+# --- evaluation -------------------------------------------------------------------------
+t_valid, t_valid_lyap = valid_prediction_time(test_data, X_pred_closed, t_test)
+n_short = round(Int, 1 / (LORENZ_LYAPUNOV * dt))
+mse_1lyap = mean(abs2, test_data[1:n_short, :] .- X_pred_closed[1:n_short, :])
+mse_open = mean(abs2, test_data .- X_pred_open)
+println("Closed-loop valid prediction time: $(round(t_valid, digits = 2)) s ",
+        "($(round(t_valid_lyap, digits = 2)) Lyapunov times)")
+println("Closed-loop MSE over the first Lyapunov time: ", mse_1lyap)
+println("Open-loop (teacher-forced) MSE over the whole test set: ", mse_open)
 
-fig
-GLMakie.save("lorenz_FHN_NN.png", fig)
+# --- long autonomous run for the attractor climate ----------------------------------------
+pred_climate_n = fhn_closed_loop_forecast(r_end, x_end, round(Int, 100.0 / dt))
+X_climate = inverse_transform(scaler, pred_climate_n)
 
-using Optim
-
-# Create a new figure
-fig = Figure(resolution = (1600, 1200))
-index_15_sec = findfirst(x -> x > 15.0, t2)
-index_10_sec = findfirst(x -> x > 10.0, t2)
-range15 = 1:index_15_sec
-range10 = 1:index_10_sec
-# 3D plot
-ax = Axis3(fig[1, 1], title = "Predicting Lorenz 63", xlabel = "x", ylabel = "y", zlabel = "z")
-lines!(ax, test_data[:, 1], test_data[:, 2], test_data[:, 3], color = :blue, label = "True")
-lines!(ax, X_predicted_rec[:, 1], X_predicted_rec[:, 2],X_predicted_rec[:, 3], color = :red, label = "Predicted")
-
-# Add grid and legend
-axislegend(ax)
-
-# Display the figure
-fig
-GLMakie.save("lorenz3d_FHN_NN.png", fig)
-
-# plot Lorenz map
-maximal_values = find_maxima_in_z(test_data[range10,:])
-scatter(maximal_values[1:end-1], maximal_values[2:end])
-maximal_trj = find_maxima_in_z(X_predicted_rec[range10,:])
-scatter!(maximal_trj[1:end-1], maximal_trj[2:end], color = :red)
-
-
-
-
+# --- plots ----------------------------------------------------------------------------------
+suffix = String(topology)
+plot_forecast(t_test, test_data, X_pred_closed,
+              "figures/lorenz_FHN_NN_$(suffix).png";
+              pred_open_loop = X_pred_open, t_valid = t_valid,
+              title = "FHN reservoir ($suffix) + NN readout " *
+                      "(closed-loop valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
+plot_forecast_3d(test_data, X_pred_closed,
+                 "figures/lorenz3d_FHN_NN_$(suffix).png";
+                 title = "FHN reservoir ($suffix): closed-loop forecast")
+plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_FHN_NN_$(suffix).png")
+println("Figures written to figures/lorenz_FHN_NN_$(suffix).png, ",
+        "figures/lorenz3d_FHN_NN_$(suffix).png, ",
+        "figures/lorenz_map_FHN_NN_$(suffix).png, ",
+        "figures/RC_FHN_reservoir_states.png")
