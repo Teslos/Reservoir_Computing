@@ -49,11 +49,14 @@ delay_steps = 10          # time-delay embedding: the readout sees
 
 # FitzHugh-Nagumo parameters
 eps_fhn = 0.05            # time-scale separation
-a_lo, a_hi = 1.05, 1.3    # per-node threshold a_i ~ U(a_lo, a_hi). |a| > 1 puts
-                          # the nodes in the *excitable* (non-self-oscillating)
-                          # regime: quiescent without input, near-linear
-                          # sub-threshold response, and fading memory --
-                          # which makes the states far more linearly decodable
+a_lo, a_hi = 0.95, 1.1    # per-node threshold a_i ~ U(a_lo, a_hi), straddling
+                          # the Hopf bifurcation at |a| = 1: a mixed population
+                          # of weakly self-oscillating (a < 1) and barely
+                          # excitable (a > 1) nodes. Maximizes susceptibility
+                          # to the input while keeping some intrinsic drive,
+                          # so the autonomous closed loop can sustain a
+                          # Lorenz-like climate (purely excitable nodes decay
+                          # to quiescence once the forecast diverges)
 coupling = 0.3            # total in-coupling per node (degree-normalized)
 R0 = 0.5                  # input coupling into the slow variable
 speed = 20.0              # global time-scale factor: matches the oscillator
