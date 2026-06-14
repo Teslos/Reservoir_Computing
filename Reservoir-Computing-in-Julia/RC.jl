@@ -2,7 +2,8 @@
 # Lorenz-63 system. The forecast is closed-loop (autonomous): after training,
 # the model's own output is fed back as input, with no access to the truth.
 #
-# Run from the repo root:  julia +1.11 --project=. Reservoir-Computing-in-Julia/RC.jl
+# Run from the repo root:
+#   julia +1.11 --project=. Reservoir-Computing-in-Julia/RC.jl [seed] [nofigs]
 
 include("common.jl")
 using .RCCommon
@@ -12,7 +13,9 @@ using Statistics
 using CairoMakie
 
 # --- hyperparameters --------------------------------------------------------
-const SEED = 42
+seed_arg = findfirst(a -> tryparse(Int, a) !== nothing, ARGS)
+SEED = seed_arg === nothing ? 42 : parse(Int, ARGS[seed_arg])
+save_figures = !("nofigs" in ARGS)
 dim_system = 3
 dim_reservoir = 500
 density = 0.02          # average in-degree 10
@@ -68,18 +71,21 @@ mse_1lyap = mean(abs2, test_data[1:n_short, :] .- X_predicted[1:n_short, :])
 println("Valid prediction time: $(round(t_valid, digits = 2)) s ",
         "($(round(t_valid_lyap, digits = 2)) Lyapunov times)")
 println("MSE over the first Lyapunov time: ", mse_1lyap)
-
-# --- long autonomous run for the attractor climate ----------------------------
-climate_n, _ = closed_loop_forecast(A, W_in, readout, R[:, end],
-                                    round(Int, 100.0 / dt))
-X_climate = inverse_transform(scaler, climate_n)
+println("RESULT method=ESN_ridge seed=$SEED NR=$dim_reservoir ",
+        "t_valid_s=$(round(t_valid, digits = 3)) t_valid_lyap=$(round(t_valid_lyap, digits = 3))")
 
 # --- plots ---------------------------------------------------------------------
-plot_forecast(t_test, test_data, X_predicted, "figures/lorenz_RC.png";
-              t_valid = t_valid,
-              title = "ESN + ridge: closed-loop Lorenz forecast " *
-                      "(valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
-plot_forecast_3d(test_data, X_predicted, "figures/lorenz3d_RC.png")
-plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_RC.png")
-println("Figures written to figures/lorenz_RC.png, figures/lorenz3d_RC.png, ",
-        "figures/lorenz_map_RC.png")
+if save_figures
+    # long autonomous run for the attractor climate
+    climate_n, _ = closed_loop_forecast(A, W_in, readout, R[:, end],
+                                        round(Int, 100.0 / dt))
+    X_climate = inverse_transform(scaler, climate_n)
+    plot_forecast(t_test, test_data, X_predicted, "figures/lorenz_RC.png";
+                  t_valid = t_valid,
+                  title = "ESN + ridge: closed-loop Lorenz forecast " *
+                          "(valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
+    plot_forecast_3d(test_data, X_predicted, "figures/lorenz3d_RC.png")
+    plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_RC.png")
+    println("Figures written to figures/lorenz_RC.png, figures/lorenz3d_RC.png, ",
+            "figures/lorenz_map_RC.png")
+end
