@@ -55,3 +55,35 @@ precise discrete-step *linear* memory, which the continuous reservoirs blur and
 the excitable FHN network handles poorly — a useful characterization showing the
 FHN reservoir's strengths lie in other temporal tasks (rich nonlinear transients,
 spiking / event-driven inputs), not exact-lag memory.
+
+## SHD spiking-digit classification
+
+`Reservoir-Computing-in-Julia/RC_SHD.jl` classifies the **Spiking Heidelberg
+Digits** — spoken digits 0–9 (English + German, 20 classes) encoded as spikes
+over 700 cochlear channels: a genuinely temporal, spiking task. Spikes are
+pre-binned to a dense `(channels × time)` matrix by `prepare_shd.py`; each sample
+is driven through a reservoir over time and a linear ridge readout on temporal-
+snapshot features classifies the 20 digits.
+
+One-time data prep (downloads ~170 MB from the Zenke lab; needs Python + h5py):
+
+    # download shd_train.h5.gz / shd_test.h5.gz into data/shd/, gunzip, then:
+    python Reservoir-Computing-in-Julia/prepare_shd.py --pool 10 --tbins 100 --per-class 150
+    julia --project=. Reservoir-Computing-in-Julia/RC_SHD.jl [seed] [quick] [nofigs] [nofhn]
+
+Result (3000 train / 1000 test, 20 classes, chance = 0.05), in `shd_results.md`:
+
+| Method | Test accuracy |
+|---|---|
+| raw input (no reservoir) | 0.400 |
+| discrete ESN | 0.520 |
+| **FHN oscillators** | **0.546** |
+
+This is the task where the reservoir earns its keep: on a real **temporal
+spiking** benchmark the FHN oscillator network beats both the discrete ESN and
+the raw binned input — the opposite of the static-digit and NARMA-10 results,
+where the reservoir added nothing. It supports the conclusion that the FHN
+reservoir's advantage is temporal/event-driven processing, not static or
+exact-lag-memory tasks. (Absolute accuracy is modest — SOTA end-to-end SNNs
+reach ~80–90% — but this is an untrained reservoir with a one-line linear
+readout; the *ranking* is the point.)

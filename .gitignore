@@ -1,3 +1,7 @@
 *.png
 *.gif
 */*.png
+# SHD and other large datasets (download/regenerate via prepare_shd.py)
+data/
+*.h5
+*.h5.gz
