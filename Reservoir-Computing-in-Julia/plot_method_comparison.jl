@@ -7,15 +7,17 @@ using Statistics
 
 methods = ["ESN + ridge\n(discrete, NR=500)",
            "LPCTESN\n(continuous, NR=300)",
+           "LPCTESN quad\n(continuous, [r; r²])",
            "FHN physical\n(grid, NR=256)"]
 data = [[6.493, 9.699, 6.448, 9.183, 8.413],   # ESN + ridge
-        [1.259, 0.842, 0.987, 1.014, 0.942],   # LPCTESN
+        [1.259, 0.842, 0.987, 1.014, 0.942],   # LPCTESN linear
+        [1.041, 1.105, 1.032, 1.050, 1.041],   # LPCTESN quadratic readout
         [0.389, 0.996, 1.078, 0.408, 0.480]]   # FHN (NN readout)
 
-fig = Figure(size = (800, 540))
+fig = Figure(size = (920, 540))
 ax = Axis(fig[1, 1], title = "Closed-loop Lorenz-63 forecast skill (seeds 1-5)",
           ylabel = "Valid prediction time (Lyapunov times)",
-          xticks = (1:3, methods))
+          xticks = (1:4, methods))
 for (i, vals) in enumerate(data)
     m, s = mean(vals), std(vals)
     barplot!(ax, [i], [m], color = (:steelblue, 0.4), width = 0.5)
