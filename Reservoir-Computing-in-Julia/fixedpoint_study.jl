@@ -16,6 +16,17 @@
 #      Float64 Euler run (i.e. best-case per-signal Q-format scaling).
 #   4. Sweep B and measure valid prediction time (Lyapunov times).
 #
+# CORRECTION (see integrator_matched.jl): the comparison this script prints
+# between the fixed-step Float64 baseline (~0.45 LT) and the "adaptive Tsit5
+# reference 1.57 LT" is NOT a clean integrator effect. Those two numbers came
+# from different readouts. A controlled paired experiment shows that for a
+# *fixed* readout, Tsit5 and fixed-step deployment give the SAME valid time --
+# the 0.45-vs-1.57 spread is dominated by NN-initialization variance (closed-
+# loop valid time ranges ~0.45-1.57 LT across readout seeds on this config).
+# The *bit-width* conclusion below is unaffected (it sweeps one fixed model):
+# ~12-bit knee, ~16 bits sufficient, collapse below 10 bits. But disregard any
+# reading of the integrator as "the dominant penalty" -- it is not.
+#
 # Run from the repo root:
 #   julia +1.11 --project=. Reservoir-Computing-in-Julia/fixedpoint_study.jl
 
