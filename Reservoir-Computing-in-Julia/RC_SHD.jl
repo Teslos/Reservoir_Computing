@@ -34,13 +34,17 @@ save_figures = !("nofigs" in ARGS)
 run_fhn = !("nofhn" in ARGS)
 rng = MersenneTwister(SEED)
 
-NR = quick ? 120 : 250
-ridge_beta = 1.0
-sr_esn = 0.9
-leak_esn = 0.6
-sigma_in = 0.2
-# FHN
-eps_fhn = 0.05; a_lo, a_hi = 0.95, 1.1; R0 = 0.5; speed_fhn = 6.0; sigma_in_fhn = 0.5
+# tuned: low leak (long memory) is the key lever for SHD; sr>1, modest input
+# scaling, many temporal snapshots, strong ridge.
+NR = quick ? 150 : 500
+TRAIN_PER = quick ? 30 : 150      # samples/class (common to all reservoirs so
+TEST_PER  = quick ? 20 : 100      # the FHN ODE stays tractable & comparison fair)
+ridge_beta = 1000.0
+sr_esn = 1.1
+leak_esn = 0.05
+sigma_in = 0.3
+# FHN (tuned for long memory: slow dynamics)
+eps_fhn = 0.05; a_lo, a_hi = 0.95, 1.1; R0 = 0.5; speed_fhn = 0.5; sigma_in_fhn = 0.3
 dt = 1.0
 
 # --- load pre-binned SHD ----------------------------------------------------
@@ -56,15 +60,15 @@ end
 classes = sort(unique(ytr)); nclass = length(classes)
 C = size(Xtr_r, 2); T = size(Xtr_r, 3)
 
-# optional subsample for speed (esp. the FHN ODE)
+# subsample to a common train/test set (keeps the FHN ODE tractable and the
+# three reservoirs compared on identical data)
 function subsample(y, per; rng)
     idx = Int[]
     for c in unique(y); ci = shuffle(rng, findall(==(c), y)); append!(idx, ci[1:min(per, length(ci))]); end
     shuffle(rng, idx)
 end
-if quick
-    tri = subsample(ytr, 20; rng=rng); tei = subsample(yte, 10; rng=rng)
-    Xtr_r, ytr, Xte_r, yte = Xtr_r[tri,:,:], ytr[tri], Xte_r[tei,:,:], yte[tei]
+let tri = subsample(ytr, TRAIN_PER; rng=rng), tei = subsample(yte, TEST_PER; rng=rng)
+    global Xtr_r, ytr, Xte_r, yte = Xtr_r[tri,:,:], ytr[tri], Xte_r[tei,:,:], yte[tei]
 end
 ntr, nte = length(ytr), length(yte)
 println("SHD: $ntr train / $nte test, $C channels x $T bins, $nclass classes, NR=$NR")
@@ -95,7 +99,7 @@ raw_features(X) = reduce(hcat, [vec(sample(X, n)) for n in 1:size(X, 1)])
 # temporal summary of a reservoir state matrix R (NR x T): the time-mean plus
 # K evenly-spaced snapshots, so the readout sees the state's time evolution
 # (essential for a temporal task) -> (K+1)*NR features.
-const K_SNAP = 5
+const K_SNAP = 8
 const FEATDIM = (K_SNAP + 1) * NR
 time_summary(R) = (idx = round.(Int, range(1, size(R, 2), length=K_SNAP));
                    vcat(vec(mean(R, dims=2)), vec(R[:, idx])))

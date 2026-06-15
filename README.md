@@ -68,22 +68,29 @@ snapshot features classifies the 20 digits.
 One-time data prep (downloads ~170 MB from the Zenke lab; needs Python + h5py):
 
     # download shd_train.h5.gz / shd_test.h5.gz into data/shd/, gunzip, then:
-    python Reservoir-Computing-in-Julia/prepare_shd.py --pool 10 --tbins 100 --per-class 150
+    python Reservoir-Computing-in-Julia/prepare_shd.py --pool 5 --tbins 100 --per-class 300
     julia --project=. Reservoir-Computing-in-Julia/RC_SHD.jl [seed] [quick] [nofigs] [nofhn]
 
-Result (3000 train / 1000 test, 20 classes, chance = 0.05), in `shd_results.md`:
+Result (tuned; 3000 train / 2000 test, 20 classes, chance = 0.05), in
+`shd_results.md`:
 
 | Method | Test accuracy |
 |---|---|
-| raw input (no reservoir) | 0.400 |
-| discrete ESN | 0.520 |
-| **FHN oscillators** | **0.546** |
+| raw input (no reservoir) | 0.570 |
+| discrete ESN | **0.726** |
+| FHN oscillators | **0.721** |
 
 This is the task where the reservoir earns its keep: on a real **temporal
-spiking** benchmark the FHN oscillator network beats both the discrete ESN and
-the raw binned input — the opposite of the static-digit and NARMA-10 results,
-where the reservoir added nothing. It supports the conclusion that the FHN
-reservoir's advantage is temporal/event-driven processing, not static or
-exact-lag-memory tasks. (Absolute accuracy is modest — SOTA end-to-end SNNs
-reach ~80–90% — but this is an untrained reservoir with a one-line linear
-readout; the *ranking* is the point.)
+spiking** benchmark both reservoirs clearly beat the raw binned input, and the
+FHN oscillator network is on par with the standard ESN — the opposite of the
+static-digit and NARMA-10 results, where the reservoir added nothing. It
+supports the conclusion that the FHN reservoir's advantage is temporal /
+event-driven processing.
+
+Tuning matters a lot here: the key lever is **long memory** over the ~1 s
+utterance — a low leak (0.05) for the ESN and slow dynamics (`speed`=0.5) for
+the FHN — together with a larger reservoir (NR=500), finer 140-channel binning,
+8 temporal-snapshot features, and strong ridge (β=1000). This lifted the FHN
+from 0.55 to 0.72 and the ESN from 0.52 to 0.73. (Absolute accuracy is still
+below SOTA end-to-end SNNs at ~80–90%, but this is an *untrained* reservoir with
+a one-line linear readout.)
