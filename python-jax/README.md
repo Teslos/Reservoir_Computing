@@ -99,3 +99,13 @@ For the most interpretable control, use `--hidden 0`: this fits the vector field
 directly as a linear combination of the quadratic dictionary. Lorenz-63 itself
 is quadratic, so this model class contains its exact vector-field form without
 a random projection or hidden nonlinear layer.
+
+Run the five-case delay-window ablation on both GPUs with:
+
+```bash
+bash run_delay_geometry_sweep.sh
+```
+
+It compares `(delays, stride) = (10,5), (16,3), (16,5), (20,5), (16,8)`
+using sequential per-GPU queues and writes one log per case plus `summary.txt`
+under `../logs/delay_geometry_<timestamp>/`.
