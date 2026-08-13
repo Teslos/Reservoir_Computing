@@ -74,8 +74,8 @@ def standardized_jacobians(fixed, mu, sd):
     return jax.vmap(jax.jacfwd(rhs_z))(fixed)
 
 
-def losses(params, projection, delays_x, deriv_y, fixed, target_jac,
-           fp_weight, jac_weight, l2_weight):
+def losses(params, projection, delays_x, deriv_y, local_x, local_y, fixed, target_jac,
+           fp_weight, local_weight, jac_weight, l2_weight):
     pred = predict(params, projection, delays_x)
     data_loss = jnp.mean((pred - deriv_y) ** 2)
 
@@ -85,21 +85,64 @@ def losses(params, projection, delays_x, deriv_y, fixed, target_jac,
 
     fp_pred = jax.vmap(equilibrium_field)(fixed)
     fp_loss = jnp.mean(fp_pred**2)
+    local_loss = jnp.mean((predict(params, projection, local_x) - local_y) ** 2)
     learned_jac = jax.vmap(jax.jacfwd(equilibrium_field))(fixed)
     jac_loss = jnp.mean((learned_jac - target_jac) ** 2)
     l2 = sum(jnp.mean(p**2) for p in params)
-    total = data_loss + fp_weight*fp_loss + jac_weight*jac_loss + l2_weight*l2
-    return total, (data_loss, fp_loss, jac_loss)
+    total = (data_loss + fp_weight*fp_loss + local_weight*local_loss
+             + jac_weight*jac_loss + l2_weight*l2)
+    return total, (data_loss, fp_loss, local_loss, jac_loss)
 
 
-def adam_train(key, params, projection, x, y, fixed, target_jac, args):
+def local_equilibrium_data(key, fixed, mu, sd, delays, stride,
+                           perturbations, local_steps, radius_min, radius_max, dt):
+    """True-flow delay histories starting close to each Lorenz equilibrium."""
+    if not (0 < radius_min <= radius_max):
+        raise ValueError("local perturbation radii must satisfy 0 < min <= max")
+    count = len(fixed) * perturbations
+    kd, kr = jax.random.split(key)
+    directions = jax.random.normal(kd, (count, 3))
+    directions /= jnp.linalg.norm(directions, axis=1, keepdims=True)
+    log_r = jax.random.uniform(kr, (count,), minval=jnp.log(radius_min), maxval=jnp.log(radius_max))
+    centers = jnp.repeat(fixed, perturbations, axis=0)
+    initial = centers + jnp.exp(log_r)[:, None] * directions
+    offset = (delays - 1) * stride
+
+    def rhs_z(z):
+        return lorenz_rhs(mu + sd*z) / sd
+
+    def rk4_z(z):
+        k1 = rhs_z(z); k2 = rhs_z(z + dt*k1/2)
+        k3 = rhs_z(z + dt*k2/2); k4 = rhs_z(z + dt*k3)
+        return z + dt*(k1 + 2*k2 + 2*k3 + k4)/6
+
+    def integrate(z0):
+        def step(z, _):
+            zn = rk4_z(z); return zn, zn
+        tail = jax.lax.scan(step, z0, None, offset + local_steps)[1]
+        return jnp.concatenate((z0[None], tail), axis=0)
+
+    trajectories = jax.vmap(integrate)(initial)
+    lag_ids = jnp.arange(delays)*stride
+
+    def examples(traj):
+        current_ids = offset + jnp.arange(local_steps)
+        ids = current_ids[:, None] - lag_ids[None, :]
+        dx = traj[ids].reshape(local_steps, 3*delays)
+        return dx, jax.vmap(rhs_z)(traj[current_ids])
+
+    lx, ly = jax.vmap(examples)(trajectories)
+    return lx.reshape(-1, 3*delays).astype(jnp.float32), ly.reshape(-1, 3).astype(jnp.float32)
+
+
+def adam_train(key, params, projection, x, y, local_x, local_y, fixed, target_jac, args):
     zeros = jax.tree.map(jnp.zeros_like, params)
     state = (zeros, zeros, jnp.array(0))
 
     @jax.jit
     def update(p, opt, xb, yb):
-        fn = lambda pp: losses(pp, projection, xb, yb, fixed, target_jac,
-                               args.fp_weight, args.jac_weight, args.l2)[0]
+        fn = lambda pp: losses(pp, projection, xb, yb, local_x, local_y, fixed, target_jac,
+                               args.fp_weight, args.local_weight, args.jac_weight, args.l2)[0]
         value, grad = jax.value_and_grad(fn)(p)
         m, v, t = opt; t += 1
         m = jax.tree.map(lambda a, g: .9*a + .1*g, m, grad)
@@ -141,7 +184,13 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--fp-weight", type=float, default=.1)
-    p.add_argument("--jac-weight", type=float, default=.005)
+    p.add_argument("--local-weight", type=float, default=.05)
+    p.add_argument("--local-perturbations", type=int, default=32, help="true local trajectories per equilibrium")
+    p.add_argument("--local-steps", type=int, default=25, help="supervised samples per local trajectory")
+    p.add_argument("--local-radius-min", type=float, default=1e-6, help="minimum standardized perturbation")
+    p.add_argument("--local-radius-max", type=float, default=1e-3, help="maximum standardized perturbation")
+    p.add_argument("--jac-weight", type=float, default=0.0,
+                   help="legacy repeated-delay Jacobian loss; local trajectories are preferred")
     p.add_argument("--l2", type=float, default=1e-6)
     p.add_argument("--train-seconds", type=float, default=200.0)
     p.add_argument("--test-seconds", type=float, default=25.0)
@@ -173,23 +222,32 @@ def main():
     deriv_y = (train_z[offset+2:] - train_z[offset:-2])/(2*dt)
     fixed = true_fixed_points(mu, sd)
     target_jac = standardized_jacobians(fixed, mu, sd)
+    local_x, local_y = local_equilibrium_data(
+        jax.random.PRNGKey(args.seed+2), fixed, mu, sd, args.delays, args.delay_stride,
+        args.local_perturbations, args.local_steps, args.local_radius_min,
+        args.local_radius_max, dt)
     projection, params = init_model(jax.random.PRNGKey(args.seed), delay_x.shape[1], args.lift, args.hidden)
     print(f"Delay embedding: {args.delays} x 3, stride={args.delay_stride} ({args.delay_stride*dt:g} s), window={(args.delays-1)*args.delay_stride*dt:g} s")
     print(f"Frozen nonlinear lift: {delay_x.shape[1]} -> {args.lift}; readout hidden={args.hidden}")
+    print(f"Equilibrium neighborhoods: {args.local_perturbations} trajectories/fixed point, "
+          f"{args.local_steps} samples each, radii=[{args.local_radius_min:g}, {args.local_radius_max:g}]")
     params = adam_train(jax.random.PRNGKey(args.seed+1), params, projection,
-                        delay_x.astype(jnp.float32), deriv_y.astype(jnp.float32), fixed, target_jac, args)
+                        delay_x.astype(jnp.float32), deriv_y.astype(jnp.float32),
+                        local_x, local_y, fixed, target_jac, args)
 
     objective = lambda p: losses(p, projection, delay_x.astype(jnp.float32), deriv_y.astype(jnp.float32),
-                                 fixed, target_jac, args.fp_weight, args.jac_weight, args.l2)[0]
+                                 local_x, local_y, fixed, target_jac, args.fp_weight,
+                                 args.local_weight, args.jac_weight, args.l2)[0]
     if not args.no_lbfgs and args.lbfgs_iterations:
         solver = LBFGS(objective, maxiter=args.lbfgs_iterations, history_size=10,
                        tol=1e-6, linesearch="zoom", jit=True)
         result = solver.run(params); params = result.params
         print(f"L-BFGS: iterations={int(result.state.iter_num)}, objective={float(result.state.value):.6g}, error={float(result.state.error):.3g}")
 
-    total, parts = losses(params, projection, delay_x, deriv_y, fixed, target_jac,
-                          args.fp_weight, args.jac_weight, args.l2)
-    print(f"Final losses: total={float(total):.6g} data={float(parts[0]):.6g} fixed_point={float(parts[1]):.6g} jacobian={float(parts[2]):.6g}")
+    total, parts = losses(params, projection, delay_x, deriv_y, local_x, local_y, fixed, target_jac,
+                          args.fp_weight, args.local_weight, args.jac_weight, args.l2)
+    print(f"Final losses: total={float(total):.6g} data={float(parts[0]):.6g} "
+          f"fixed_point={float(parts[1]):.6g} local={float(parts[2]):.6g} jacobian={float(parts[3]):.6g}")
 
     history0 = train_z[-((args.delays-1)*args.delay_stride+1):]
     @functools.partial(jax.jit, static_argnums=(2,))
@@ -206,8 +264,9 @@ def main():
     seconds, lyap = valid_time(test, pred, dt)
     print(f"Closed-loop valid prediction time: {seconds:.2f} s ({lyap:.3f} Lyapunov times)")
     print(f"RESULT seed={args.seed} delays={args.delays} stride={args.delay_stride} lift={args.lift} hidden={args.hidden} "
-          f"fp_weight={args.fp_weight:g} jac_weight={args.jac_weight:g} t_valid_s={seconds:.3f} t_valid_lyap={lyap:.3f} "
-          f"fp_loss={float(parts[1]):.6g} jac_loss={float(parts[2]):.6g}")
+          f"fp_weight={args.fp_weight:g} local_weight={args.local_weight:g} jac_weight={args.jac_weight:g} "
+          f"t_valid_s={seconds:.3f} t_valid_lyap={lyap:.3f} fp_loss={float(parts[1]):.6g} "
+          f"local_loss={float(parts[2]):.6g} jac_loss={float(parts[3]):.6g}")
 
     if not args.no_figs:
         import matplotlib.pyplot as plt
