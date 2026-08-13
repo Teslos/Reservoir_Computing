@@ -75,8 +75,11 @@ machine-readable `RESULT` line reports forecast Lyapunov time plus fixed-point,
 local-neighborhood, and diagnostic Jacobian residuals.
 
 After Adam and L-BFGS, the default training performs a 10-to-100-step
-autonomous rollout curriculum. A 25-second tail is excluded from all fitting
-and used for multi-start validation, reporting median, lower-quartile, and
-worst-case Lyapunov times. Use `--rollout-epochs 0` for the old one-step-only
-workflow. `--projection-seed`, `--network-seed`, and `--local-seed` independently
-control the frozen lift, readout initialization, and equilibrium trajectories.
+autonomous rollout curriculum with conservative learning rate, global gradient
+clipping, and three batches per epoch. The post-L-BFGS model is checkpoint zero;
+fixed held-out starts select later checkpoints, geometry degradation is bounded,
+and early stopping restores the best accepted model. A 25-second tail is
+excluded from all fitting and reports median, lower-quartile, and worst-case
+Lyapunov times. Use `--rollout-epochs 0` for the old one-step-only workflow.
+`--projection-seed`, `--network-seed`, and `--local-seed` independently control
+the frozen lift, readout initialization, and equilibrium trajectories.

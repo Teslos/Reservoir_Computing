@@ -247,27 +247,85 @@ def rollout_finetune(key, params, projection, train_z, delay_x, deriv_y,
                 args.jac_weight, args.l2)
             return args.rollout_weight*roll + base, roll
         (value, roll), grad = jax.value_and_grad(objective, has_aux=True)(p)
+        grad_norm = jnp.sqrt(sum(jnp.sum(g*g) for g in jax.tree.leaves(grad)))
+        clip_scale = jnp.minimum(1.0, args.rollout_clip_norm/(grad_norm+1e-12))
+        grad = jax.tree.map(lambda g: g*clip_scale, grad)
         m, v, t = state; t += 1
         m = jax.tree.map(lambda a, g: .9*a + .1*g, m, grad)
         v = jax.tree.map(lambda a, g: .999*a + .001*g*g, v, grad)
         mh = jax.tree.map(lambda a: a/(1-.9**t), m)
         vh = jax.tree.map(lambda a: a/(1-.999**t), v)
         p = jax.tree.map(lambda a, mm, vv: a-args.rollout_lr*mm/(jnp.sqrt(vv)+1e-8), p, mh, vh)
-        return p, (m, v, t), value, roll
+        return p, (m, v, t), value, roll, grad_norm
+
+    # Checkpoint on the trained horizon; long chaotic-horizon MSE becomes
+    # meaningless after trajectories have correctly decorrelated.
+    val_horizon = min(args.rollout_steps, args.validation_steps,
+                      len(train_z)-fit_end-1)
+    val_starts = jnp.asarray(np.unique(np.linspace(
+        fit_end, len(train_z)-val_horizon-1,
+        args.validation_starts).round().astype(int)))
+
+    @jax.jit
+    def validate(p):
+        def one(start):
+            hist = jax.lax.dynamic_slice(train_z, (start-offset, 0), (offset+1, 3))
+            pred = rollout_from_history(p, projection, hist, val_horizon,
+                                        args.delays, args.delay_stride, .01)
+            truth = jax.lax.dynamic_slice(train_z, (start+1, 0), (val_horizon, 3))
+            return jnp.mean((pred-truth)**2)
+        val_roll = jnp.mean(jax.vmap(one)(val_starts))
+        _, parts = losses(
+            p, projection, delay_x[:1], deriv_y[:1], local_x, local_y, fixed,
+            target_jac, tangent_advance, tangent_embedding, args.fp_weight,
+            args.local_weight, args.tangent_weight, args.jac_weight, args.l2)
+        score = val_roll + args.fp_weight*parts[1] + args.local_weight*parts[2]
+        return score, val_roll, parts[1], parts[2]
 
     max_horizon = args.rollout_steps
+    base_score, base_val, base_fp, base_local = validate(params)
+    best_params, best_score, best_epoch = params, float(base_score), 0
+    fp_limit = max(10*float(base_fp), 1e-5)
+    local_limit = max(10*float(base_local), 1e-3)
+    stale_epochs = 0
+    print(f"Rollout checkpoint 0 (post-L-BFGS): score={best_score:.6g} "
+          f"val={float(base_val):.6g} fp={float(base_fp):.3g} local={float(base_local):.3g}")
     for epoch in range(args.rollout_epochs):
         # Smooth 10-step curriculum over the first 60% of fine-tuning.
         fraction = min(1.0, (epoch+1)/max(1, int(.6*args.rollout_epochs)))
         horizon = min(max_horizon, max(10, 10*round(max_horizon*fraction/10)))
-        key, ks, kd = jax.random.split(key, 3)
-        starts = jax.random.randint(ks, (args.rollout_starts,), offset,
-                                    fit_end-horizon)
-        data_ids = jax.random.randint(kd, (args.batch_size,), 0, len(delay_x))
-        params, opt, value, roll = update(params, opt, starts, data_ids, horizon)
-        if (epoch+1) % 10 == 0 or epoch+1 == args.rollout_epochs:
-            print(f"Rollout epoch {epoch+1}: K={horizon} objective={float(value):.6g} rollout={float(roll):.6g}")
-    return params
+        epoch_values, epoch_rolls, epoch_norms = [], [], []
+        for _ in range(args.rollout_batches):
+            key, ks, kd = jax.random.split(key, 3)
+            starts = jax.random.randint(ks, (args.rollout_starts,), offset,
+                                        fit_end-horizon)
+            data_ids = jax.random.randint(kd, (args.batch_size,), 0, len(delay_x))
+            params, opt, value, roll, grad_norm = update(
+                params, opt, starts, data_ids, horizon)
+            epoch_values.append(value); epoch_rolls.append(roll); epoch_norms.append(grad_norm)
+
+        should_validate = ((epoch+1) % args.rollout_validate_every == 0
+                           or epoch+1 == args.rollout_epochs)
+        if should_validate:
+            score, val_roll, fp, local = validate(params)
+            score_f, fp_f, local_f = float(score), float(fp), float(local)
+            geometry_ok = fp_f <= fp_limit and local_f <= local_limit
+            improved = geometry_ok and score_f < best_score
+            if improved:
+                best_params, best_score, best_epoch = params, score_f, epoch+1
+                stale_epochs = 0
+            else:
+                stale_epochs += args.rollout_validate_every
+            marker = " saved" if improved else (" rejected-geometry" if not geometry_ok else "")
+            print(f"Rollout epoch {epoch+1}: K={horizon} objective={float(jnp.mean(jnp.stack(epoch_values))):.6g} "
+                  f"rollout={float(jnp.mean(jnp.stack(epoch_rolls))):.6g} grad={float(jnp.mean(jnp.stack(epoch_norms))):.3g} "
+                  f"val={float(val_roll):.6g} score={score_f:.6g} fp={fp_f:.3g} local={local_f:.3g}{marker}")
+            if stale_epochs >= args.rollout_patience:
+                print(f"Rollout early stopping at epoch {epoch+1}; no accepted improvement for {stale_epochs} epochs")
+                break
+    print(f"Restored rollout checkpoint {best_epoch}: score={best_score:.6g} "
+          f"(geometry limits fp<={fp_limit:.3g}, local<={local_limit:.3g})")
+    return best_params
 
 
 def parse_args():
@@ -298,8 +356,12 @@ def parse_args():
     p.add_argument("--rollout-epochs", type=int, default=100)
     p.add_argument("--rollout-steps", type=int, default=100)
     p.add_argument("--rollout-starts", type=int, default=16)
-    p.add_argument("--rollout-weight", type=float, default=1.0)
-    p.add_argument("--rollout-lr", type=float, default=1e-4)
+    p.add_argument("--rollout-batches", type=int, default=3)
+    p.add_argument("--rollout-weight", type=float, default=.1)
+    p.add_argument("--rollout-lr", type=float, default=1e-5)
+    p.add_argument("--rollout-clip-norm", type=float, default=1.0)
+    p.add_argument("--rollout-validate-every", type=int, default=5)
+    p.add_argument("--rollout-patience", type=int, default=20)
     p.add_argument("--validation-seconds", type=float, default=25.0)
     p.add_argument("--validation-starts", type=int, default=20)
     p.add_argument("--validation-steps", type=int, default=500)
@@ -322,6 +384,7 @@ def main():
         args.lift, args.hidden = min(args.lift, 64), min(args.hidden, 32)
         args.adam_epochs, args.lbfgs_iterations = min(args.adam_epochs, 3), min(args.lbfgs_iterations, 2)
         args.rollout_epochs, args.rollout_steps = min(args.rollout_epochs, 2), min(args.rollout_steps, 10)
+        args.rollout_batches, args.rollout_validate_every = 1, 1
         args.validation_seconds, args.validation_starts, args.validation_steps = 1.0, 3, 25
     dt = .01; transient = 20.0
     ntr, nte, n0 = round(args.train_seconds/dt)+1, round(args.test_seconds/dt), round(transient/dt)
