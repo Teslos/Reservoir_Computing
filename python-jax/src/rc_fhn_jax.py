@@ -227,10 +227,13 @@ def parse_args():
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--epochs", type=int, default=400)
     p.add_argument("--beta", type=float, default=1e-4)
-    p.add_argument("--coupling", type=float, default=0.3)
+    p.add_argument("--coupling", type=float, default=0.20,
+                   help="degree-normalized FHN coupling (default: 0.20, edge-of-chaos candidate)")
     p.add_argument("--sigma-in", type=float, default=1.5)
-    p.add_argument("--a-lo", type=float, default=0.95)
-    p.add_argument("--a-hi", type=float, default=1.10)
+    p.add_argument("--a-lo", type=float, default=0.98,
+                   help="lower FHN threshold bound (default: 0.98, near Hopf boundary)")
+    p.add_argument("--a-hi", type=float, default=1.04,
+                   help="upper FHN threshold bound (default: 1.04, near Hopf boundary)")
     p.add_argument("--quad", action="store_true")
     p.add_argument("--partial", action="store_true")
     p.add_argument("--no-figs", action="store_true")
@@ -241,6 +244,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.coupling < 0:
+        raise ValueError("--coupling must be non-negative")
+    if args.a_lo > args.a_hi:
+        raise ValueError("--a-lo must be no greater than --a-hi")
     devices = jax.devices()
     print(f"JAX {jax.__version__}; devices: {devices}; backend: {jax.default_backend()}")
     if args.require_gpu and jax.default_backend() != "gpu":
@@ -259,6 +266,7 @@ def main():
     wc = jnp.asarray(weighted_coupling(adj, args.coupling, rng))
     strength = wc.sum(1)
     print(f"Topology: {args.topology}, {args.nodes} nodes, {int(adj.sum())} directed edges, density {adj.mean():.3f}")
+    print(f"FHN regime: coupling={args.coupling:g}, a~U({args.a_lo:g}, {args.a_hi:g})")
     in_dim = 1 if args.partial else 3
     win = jnp.asarray(2 * args.sigma_in * (rng.random((args.nodes, in_dim)) - 0.5), dtype=jnp.float32)
     a_fhn = jnp.asarray(rng.uniform(args.a_lo, args.a_hi, args.nodes), dtype=jnp.float32)
@@ -316,6 +324,7 @@ def main():
     print(f"Open-loop (teacher-forced) MSE: {mse_open:.6g}")
     flags = f" beta={args.beta:g}" if args.readout == "ridge" else f" hidden={args.hidden} quad={str(args.quad).lower()}"
     print(f"RESULT topology={args.topology} seed={args.seed} readout={args.readout}{flags} "
+          f"coupling={args.coupling:g} a_lo={args.a_lo:g} a_hi={args.a_hi:g} "
           f"partial={str(args.partial).lower()} t_valid_s={t_valid:.3f} t_valid_lyap={t_lyap:.3f} mse_open={mse_open:.4f}")
 
     if not args.no_figs:

@@ -42,3 +42,10 @@ uv run rc-fhn-jax grid 42 --partial --nodes 256
 
 Use `--require-gpu` in automated runs to fail instead of silently using the
 CPU. Run `uv run rc-fhn-jax --help` for every parameter.
+
+The defaults use an edge-of-chaos candidate regime: degree-normalized coupling
+`0.20` and heterogeneous FHN thresholds `a ~ U(0.98, 1.04)`. This keeps the
+population close to the Hopf boundary at `|a| = 1` while reducing collective
+synchronization. These are testable candidate settings, not a claim that the
+conditional Lyapunov exponent is already optimal; override them with
+`--coupling`, `--a-lo`, and `--a-hi` for sweeps.
