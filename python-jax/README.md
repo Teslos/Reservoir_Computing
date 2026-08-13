@@ -73,3 +73,10 @@ penalty remains available through `--jac-weight`, but defaults to zero because
 it is not the full Jacobian of the autonomous delay-buffer map. The
 machine-readable `RESULT` line reports forecast Lyapunov time plus fixed-point,
 local-neighborhood, and diagnostic Jacobian residuals.
+
+After Adam and L-BFGS, the default training performs a 10-to-100-step
+autonomous rollout curriculum. A 25-second tail is excluded from all fitting
+and used for multi-start validation, reporting median, lower-quartile, and
+worst-case Lyapunov times. Use `--rollout-epochs 0` for the old one-step-only
+workflow. `--projection-seed`, `--network-seed`, and `--local-seed` independently
+control the frozen lift, readout initialization, and equilibrium trajectories.

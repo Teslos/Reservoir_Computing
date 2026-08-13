@@ -211,9 +211,71 @@ def valid_time(truth, pred, dt):
     return seconds, seconds*LYAPUNOV
 
 
+def rollout_from_history(params, projection, history, steps, delays, stride, dt):
+    """Differentiable autonomous delay-buffer rollout in standardized space."""
+    def step(hist, _):
+        ids = jnp.arange(delays) * stride
+        delay = hist[-1-ids].reshape(-1)
+        xn = jnp.clip(hist[-1] + dt*predict(params, projection, delay), -5, 5)
+        hist = jnp.concatenate((hist[1:], xn[None]), axis=0)
+        return hist, xn
+    return jax.lax.scan(step, history, None, steps)[1]
+
+
+def rollout_finetune(key, params, projection, train_z, delay_x, deriv_y,
+                     local_x, local_y, fixed, target_jac, tangent_advance,
+                     tangent_embedding, fit_end, offset, args):
+    if args.rollout_epochs <= 0:
+        return params
+    zeros = jax.tree.map(jnp.zeros_like, params)
+    opt = (zeros, zeros, jnp.array(0))
+
+    @functools.partial(jax.jit, static_argnums=(4,))
+    def update(p, state, starts, data_ids, horizon):
+        def objective(pp):
+            def one(start):
+                hist = jax.lax.dynamic_slice(train_z, (start-offset, 0), (offset+1, 3))
+                pred = rollout_from_history(pp, projection, hist, horizon,
+                                            args.delays, args.delay_stride, .01)
+                truth = jax.lax.dynamic_slice(train_z, (start+1, 0), (horizon, 3))
+                return jnp.mean((pred-truth)**2)
+            roll = jnp.mean(jax.vmap(one)(starts))
+            base, _ = losses(
+                pp, projection, delay_x[data_ids], deriv_y[data_ids], local_x,
+                local_y, fixed, target_jac, tangent_advance, tangent_embedding,
+                args.fp_weight, args.local_weight, args.tangent_weight,
+                args.jac_weight, args.l2)
+            return args.rollout_weight*roll + base, roll
+        (value, roll), grad = jax.value_and_grad(objective, has_aux=True)(p)
+        m, v, t = state; t += 1
+        m = jax.tree.map(lambda a, g: .9*a + .1*g, m, grad)
+        v = jax.tree.map(lambda a, g: .999*a + .001*g*g, v, grad)
+        mh = jax.tree.map(lambda a: a/(1-.9**t), m)
+        vh = jax.tree.map(lambda a: a/(1-.999**t), v)
+        p = jax.tree.map(lambda a, mm, vv: a-args.rollout_lr*mm/(jnp.sqrt(vv)+1e-8), p, mh, vh)
+        return p, (m, v, t), value, roll
+
+    max_horizon = args.rollout_steps
+    for epoch in range(args.rollout_epochs):
+        # Smooth 10-step curriculum over the first 60% of fine-tuning.
+        fraction = min(1.0, (epoch+1)/max(1, int(.6*args.rollout_epochs)))
+        horizon = min(max_horizon, max(10, 10*round(max_horizon*fraction/10)))
+        key, ks, kd = jax.random.split(key, 3)
+        starts = jax.random.randint(ks, (args.rollout_starts,), offset,
+                                    fit_end-horizon)
+        data_ids = jax.random.randint(kd, (args.batch_size,), 0, len(delay_x))
+        params, opt, value, roll = update(params, opt, starts, data_ids, horizon)
+        if (epoch+1) % 10 == 0 or epoch+1 == args.rollout_epochs:
+            print(f"Rollout epoch {epoch+1}: K={horizon} objective={float(value):.6g} rollout={float(roll):.6g}")
+    return params
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("seed", nargs="?", type=int, default=42)
+    p.add_argument("--projection-seed", type=int)
+    p.add_argument("--network-seed", type=int)
+    p.add_argument("--local-seed", type=int)
     p.add_argument("--delays", type=int, default=16)
     p.add_argument("--delay-stride", type=int, default=5, help="samples between delays; dt=0.01 s")
     p.add_argument("--lift", type=int, default=512)
@@ -224,7 +286,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--fp-weight", type=float, default=.1)
     p.add_argument("--local-weight", type=float, default=.05)
-    p.add_argument("--tangent-weight", type=float, default=.01,
+    p.add_argument("--tangent-weight", type=float, default=0.0,
                    help="physical delay-manifold Jacobian weight")
     p.add_argument("--local-perturbations", type=int, default=32, help="true local trajectories per equilibrium")
     p.add_argument("--local-steps", type=int, default=25, help="supervised samples per local trajectory")
@@ -233,6 +295,14 @@ def parse_args():
     p.add_argument("--jac-weight", type=float, default=0.0,
                    help="legacy repeated-delay Jacobian loss; local trajectories are preferred")
     p.add_argument("--l2", type=float, default=1e-6)
+    p.add_argument("--rollout-epochs", type=int, default=100)
+    p.add_argument("--rollout-steps", type=int, default=100)
+    p.add_argument("--rollout-starts", type=int, default=16)
+    p.add_argument("--rollout-weight", type=float, default=1.0)
+    p.add_argument("--rollout-lr", type=float, default=1e-4)
+    p.add_argument("--validation-seconds", type=float, default=25.0)
+    p.add_argument("--validation-starts", type=int, default=20)
+    p.add_argument("--validation-steps", type=int, default=500)
     p.add_argument("--train-seconds", type=float, default=200.0)
     p.add_argument("--test-seconds", type=float, default=25.0)
     p.add_argument("--no-lbfgs", action="store_true")
@@ -251,6 +321,8 @@ def main():
         args.train_seconds, args.test_seconds = 10.0, 2.0
         args.lift, args.hidden = min(args.lift, 64), min(args.hidden, 32)
         args.adam_epochs, args.lbfgs_iterations = min(args.adam_epochs, 3), min(args.lbfgs_iterations, 2)
+        args.rollout_epochs, args.rollout_steps = min(args.rollout_epochs, 2), min(args.rollout_steps, 10)
+        args.validation_seconds, args.validation_starts, args.validation_steps = 1.0, 3, 25
     dt = .01; transient = 20.0
     ntr, nte, n0 = round(args.train_seconds/dt)+1, round(args.test_seconds/dt), round(transient/dt)
     trajectory = generate(n0+ntr+nte)
@@ -261,17 +333,29 @@ def main():
     # Central-difference target in standardized units per second.
     delay_x = delay_x[1:-1]
     deriv_y = (train_z[offset+2:] - train_z[offset:-2])/(2*dt)
+    validation_samples = round(args.validation_seconds/dt)
+    fit_end = len(train_z) - validation_samples
+    if fit_end <= offset + args.rollout_steps + 1:
+        raise ValueError("validation tail leaves too little fitting data")
+    fit_rows = fit_end - offset - 1
+    delay_x, deriv_y = delay_x[:fit_rows], deriv_y[:fit_rows]
     fixed = true_fixed_points(mu, sd)
     target_jac = standardized_jacobians(fixed, mu, sd)
     tangent_advance, tangent_embedding = physical_tangent_maps(
         target_jac, args.delays, args.delay_stride, dt)
+    projection_seed = args.seed if args.projection_seed is None else args.projection_seed
+    network_seed = args.seed if args.network_seed is None else args.network_seed
+    local_seed = args.seed+2 if args.local_seed is None else args.local_seed
     local_x, local_y = local_equilibrium_data(
-        jax.random.PRNGKey(args.seed+2), fixed, mu, sd, args.delays, args.delay_stride,
+        jax.random.PRNGKey(local_seed), fixed, mu, sd, args.delays, args.delay_stride,
         args.local_perturbations, args.local_steps, args.local_radius_min,
         args.local_radius_max, dt)
-    projection, params = init_model(jax.random.PRNGKey(args.seed), delay_x.shape[1], args.lift, args.hidden)
+    projection, _ = init_model(jax.random.PRNGKey(projection_seed), delay_x.shape[1], args.lift, args.hidden)
+    _, params = init_model(jax.random.PRNGKey(network_seed), delay_x.shape[1], args.lift, args.hidden)
     print(f"Delay embedding: {args.delays} x 3, stride={args.delay_stride} ({args.delay_stride*dt:g} s), window={(args.delays-1)*args.delay_stride*dt:g} s")
     print(f"Frozen nonlinear lift: {delay_x.shape[1]} -> {args.lift}; readout hidden={args.hidden}")
+    print(f"Random seeds: projection={projection_seed}, network={network_seed}, local={local_seed}; "
+          f"held-out tail={args.validation_seconds:g} s")
     print(f"Equilibrium neighborhoods: {args.local_perturbations} trajectories/fixed point, "
           f"{args.local_steps} samples each, radii=[{args.local_radius_min:g}, {args.local_radius_max:g}]")
     print(f"Physical tangent regularizer: weight={args.tangent_weight:g}, exact exp(dt*J) over "
@@ -291,6 +375,12 @@ def main():
         result = solver.run(params); params = result.params
         print(f"L-BFGS: iterations={int(result.state.iter_num)}, objective={float(result.state.value):.6g}, error={float(result.state.error):.3g}")
 
+    params = rollout_finetune(
+        jax.random.PRNGKey(network_seed+1000), params, projection,
+        train_z.astype(jnp.float32), delay_x.astype(jnp.float32),
+        deriv_y.astype(jnp.float32), local_x, local_y, fixed, target_jac,
+        tangent_advance, tangent_embedding, fit_end, offset, args)
+
     total, parts = losses(
         params, projection, delay_x, deriv_y, local_x, local_y, fixed, target_jac,
         tangent_advance, tangent_embedding, args.fp_weight, args.local_weight,
@@ -302,23 +392,31 @@ def main():
     history0 = train_z[-((args.delays-1)*args.delay_stride+1):]
     @functools.partial(jax.jit, static_argnums=(2,))
     def rollout(history, p, steps):
-        def step(hist, _):
-            ids = jnp.arange(args.delays)*args.delay_stride
-            d = hist[-1-ids].reshape(-1)
-            xn = jnp.clip(hist[-1] + dt*predict(p, projection, d), -5, 5)
-            hist = jnp.concatenate((hist[1:], xn[None]), axis=0)
-            return hist, xn
-        return jax.lax.scan(step, history, None, steps)[1]
+        return rollout_from_history(p, projection, history, steps,
+                                    args.delays, args.delay_stride, dt)
     pred_z = rollout(history0.astype(jnp.float32), params, len(test_z))
     pred = pred_z*sd+mu
     seconds, lyap = valid_time(test, pred, dt)
+    val_horizon = min(args.validation_steps, len(train_z)-fit_end-1)
+    val_starts = np.unique(np.linspace(fit_end, len(train_z)-val_horizon-1,
+                                      args.validation_starts).round().astype(int))
+    val_lyap = []
+    for start in val_starts:
+        hist = train_z[start-offset:start+1].astype(jnp.float32)
+        pz = rollout(hist, params, val_horizon)
+        _, lt = valid_time(train_z[start+1:start+1+val_horizon], pz, dt)
+        val_lyap.append(lt)
+    val_lyap = np.asarray(val_lyap)
+    print(f"Held-out multi-start Lyapunov times: median={np.median(val_lyap):.3f} "
+          f"q25={np.quantile(val_lyap,.25):.3f} min={val_lyap.min():.3f} n={len(val_lyap)}")
     print(f"Closed-loop valid prediction time: {seconds:.2f} s ({lyap:.3f} Lyapunov times)")
     print(f"RESULT seed={args.seed} delays={args.delays} stride={args.delay_stride} lift={args.lift} hidden={args.hidden} "
           f"fp_weight={args.fp_weight:g} local_weight={args.local_weight:g} "
           f"tangent_weight={args.tangent_weight:g} jac_weight={args.jac_weight:g} "
           f"t_valid_s={seconds:.3f} t_valid_lyap={lyap:.3f} fp_loss={float(parts[1]):.6g} "
           f"local_loss={float(parts[2]):.6g} tangent_loss={float(parts[3]):.6g} "
-          f"jac_loss={float(parts[4]):.6g}")
+          f"jac_loss={float(parts[4]):.6g} val_median_lyap={np.median(val_lyap):.3f} "
+          f"val_q25_lyap={np.quantile(val_lyap,.25):.3f} val_min_lyap={val_lyap.min():.3f}")
 
     if not args.no_figs:
         import matplotlib.pyplot as plt
