@@ -355,14 +355,14 @@ def rollout_finetune(key, params, projection, train_z, delay_x, deriv_y,
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("seed", nargs="?", type=int, default=42)
-    p.add_argument("--projection-seed", type=int)
-    p.add_argument("--network-seed", type=int)
-    p.add_argument("--local-seed", type=int)
+    p.add_argument("seed", nargs="?", type=int, default=44)
+    p.add_argument("--projection-seed", type=int, default=44)
+    p.add_argument("--network-seed", type=int, default=43)
+    p.add_argument("--local-seed", type=int, default=44)
     p.add_argument("--delays", type=int, default=16)
-    p.add_argument("--delay-stride", type=int, default=5, help="samples between delays; dt=0.01 s")
+    p.add_argument("--delay-stride", type=int, default=12, help="samples between delays; dt=0.01 s")
     p.add_argument("--lift", type=int, default=512)
-    p.add_argument("--lift-kind", choices=("random", "polynomial"), default="random",
+    p.add_argument("--lift-kind", choices=("random", "polynomial"), default="polynomial",
                    help="random tanh lift or deterministic linear+quadratic dictionary")
     p.add_argument("--hidden", type=int, default=256,
                    help="readout hidden width; 0 selects a direct linear readout")
@@ -395,6 +395,7 @@ def parse_args():
     p.add_argument("--validation-steps", type=int, default=500)
     p.add_argument("--train-seconds", type=float, default=200.0)
     p.add_argument("--test-seconds", type=float, default=25.0)
+    p.add_argument("--climate-seconds", type=float, default=200.0)
     p.add_argument("--no-lbfgs", action="store_true")
     p.add_argument("--no-figs", action="store_true")
     p.add_argument("--quick", action="store_true")
@@ -416,6 +417,7 @@ def main():
         args.rollout_epochs, args.rollout_steps = min(args.rollout_epochs, 2), min(args.rollout_steps, 10)
         args.rollout_batches, args.rollout_validate_every = 1, 1
         args.validation_seconds, args.validation_starts, args.validation_steps = 1.0, 3, 25
+        args.climate_seconds = min(args.climate_seconds, 2.0)
     dt = .01; transient = 20.0
     ntr, nte, n0 = round(args.train_seconds/dt)+1, round(args.test_seconds/dt), round(transient/dt)
     trajectory = generate(n0+ntr+nte)
@@ -436,9 +438,9 @@ def main():
     target_jac = standardized_jacobians(fixed, mu, sd)
     tangent_advance, tangent_embedding = physical_tangent_maps(
         target_jac, args.delays, args.delay_stride, dt)
-    projection_seed = args.seed if args.projection_seed is None else args.projection_seed
-    network_seed = args.seed if args.network_seed is None else args.network_seed
-    local_seed = args.seed+2 if args.local_seed is None else args.local_seed
+    projection_seed = args.projection_seed
+    network_seed = args.network_seed
+    local_seed = args.local_seed
     local_x, local_y = local_equilibrium_data(
         jax.random.PRNGKey(local_seed), fixed, mu, sd, args.delays, args.delay_stride,
         args.local_perturbations, args.local_steps, args.local_radius_min,
@@ -519,6 +521,7 @@ def main():
     if not args.no_figs:
         import matplotlib.pyplot as plt
         out = Path(__file__).resolve().parents[2]/"figures"; out.mkdir(exist_ok=True)
+        suffix = f"{args.lift_kind}_d{args.delays}_s{args.delay_stride}_seed{args.seed}"
         t = np.arange(1, len(test)+1)*dt
         fig, axes = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
         for k, label in enumerate("xyz"):
@@ -526,8 +529,33 @@ def main():
             axes[k].plot(t, np.asarray(pred[:, k]), "r", label="delay model")
             axes[k].axvline(seconds, color="gray", ls=":"); axes[k].set_ylabel(label)
         axes[0].legend(); axes[-1].set_xlabel("time (s)"); fig.tight_layout()
-        path = out/f"lorenz_delay_fp_seed{args.seed}.png"; fig.savefig(path, dpi=160); plt.close(fig)
-        print(f"Figure written to {path}")
+        forecast_path = out/f"lorenz_delay_fp_{suffix}.png"
+        fig.savefig(forecast_path, dpi=160); fig.savefig(forecast_path.with_suffix(".pdf")); plt.close(fig)
+
+        fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(projection="3d")
+        ax.plot(*np.asarray(test).T, color="black", alpha=.65, lw=.8, label="True")
+        ax.plot(*np.asarray(pred).T, color="red", alpha=.75, lw=.8, label="Delay model")
+        ax.set(xlabel="x", ylabel="y", zlabel="z", title="Lorenz-63 closed-loop trajectory")
+        ax.legend(); fig.tight_layout()
+        path3d = out/f"lorenz3d_delay_fp_{suffix}.png"
+        fig.savefig(path3d, dpi=160); fig.savefig(path3d.with_suffix(".pdf")); plt.close(fig)
+
+        climate_steps = round(args.climate_seconds/dt)
+        climate_z = rollout(history0.astype(jnp.float32), params, climate_steps)
+        climate = np.asarray(climate_z*sd+mu)
+        truth_np = np.asarray(train)
+        def maxima(x):
+            z = x[:, 2]
+            return z[1:-1][(z[1:-1] > z[:-2]) & (z[1:-1] > z[2:])]
+        mt, mp = maxima(truth_np), maxima(climate)
+        fig, ax = plt.subplots(figsize=(7, 6))
+        ax.scatter(mt[:-1], mt[1:], s=9, c="black", alpha=.55, label="True")
+        ax.scatter(mp[:-1], mp[1:], s=9, c="red", alpha=.55, label="Delay-model climate")
+        ax.set(xlabel=r"$z_n$", ylabel=r"$z_{n+1}$", title="Lorenz return map")
+        ax.legend(); fig.tight_layout()
+        map_path = out/f"lorenz_map_delay_fp_{suffix}.png"
+        fig.savefig(map_path, dpi=160); fig.savefig(map_path.with_suffix(".pdf")); plt.close(fig)
+        print(f"Figures written to {forecast_path}, {path3d}, {map_path}")
 
 
 if __name__ == "__main__":

@@ -119,3 +119,10 @@ bash run_delay_stride_sweep.sh
 
 This similarly uses both GPUs and writes results under
 `../logs/delay_stride_<timestamp>/`.
+
+The main command now defaults to the best validated configuration: polynomial
+features, 16 delays at stride 12 (a 1.80-second window), MLP(256), network seed
+43, and local-trajectory seed 44. With figures enabled it writes the component
+forecast, 3D trajectory, and a Lorenz return map from a 200-second autonomous
+climate rollout in both PNG and PDF formats. Change the climate duration with
+`--climate-seconds`.
