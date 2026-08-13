@@ -109,3 +109,13 @@ bash run_delay_geometry_sweep.sh
 It compares `(delays, stride) = (10,5), (16,3), (16,5), (20,5), (16,8)`
 using sequential per-GPU queues and writes one log per case plus `summary.txt`
 under `../logs/delay_geometry_<timestamp>/`.
+
+After the coarse sweep, refine the 16-delay spacing over strides
+`6, 7, 8, 9, 10, 12` with:
+
+```bash
+bash run_delay_stride_sweep.sh
+```
+
+This similarly uses both GPUs and writes results under
+`../logs/delay_stride_<timestamp>/`.
