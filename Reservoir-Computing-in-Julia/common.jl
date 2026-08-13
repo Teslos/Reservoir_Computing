@@ -172,6 +172,19 @@ end
 # --- plotting ---------------------------------------------------------------
 
 """
+    save_vector(path, fig)
+
+Save `fig` at `path` and, when `path` is a raster format, additionally emit a
+vector PDF alongside it. Figures that end up in the manuscript are line art, so
+the PDF is what should be included there; the PNG is kept for quick viewing.
+"""
+function save_vector(path::AbstractString, fig)
+    save(path, fig)
+    endswith(lowercase(path), ".png") && save(replace(path, r"(?i)\.png$" => ".pdf"), fig)
+    return fig
+end
+
+"""
     plot_forecast(t, truth, pred, path; pred_open_loop, t_valid, title)
 
 Three stacked panels (x, y, z) comparing truth and the closed-loop forecast.
@@ -198,7 +211,7 @@ function plot_forecast(t, truth, pred, path::AbstractString;
         end
         k == 1 && axislegend(ax, position = :rt, framevisible = false)
     end
-    save(path, fig)
+    save_vector(path, fig)
     return fig
 end
 
@@ -211,7 +224,7 @@ function plot_forecast_3d(truth, pred, path::AbstractString;
     lines!(ax, pred[:, 1], pred[:, 2], pred[:, 3], color = (:red, 0.7),
            label = "Predicted")
     axislegend(ax)
-    save(path, fig)
+    save_vector(path, fig)
     return fig
 end
 
@@ -232,7 +245,7 @@ function plot_lorenz_map(truth_traj, pred_traj, path::AbstractString)
     scatter!(ax, mp[1:(end - 1)], mp[2:end], color = (:red, 0.6),
              markersize = 7, label = "Predicted")
     axislegend(ax, position = :lt)
-    save(path, fig)
+    save_vector(path, fig)
     return fig
 end
 

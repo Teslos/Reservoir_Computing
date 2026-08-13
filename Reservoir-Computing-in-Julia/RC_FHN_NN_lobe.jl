@@ -24,6 +24,7 @@ using Statistics
 using OrdinaryDiffEq
 using Flux
 using CairoMakie
+using Printf
 
 # --- hyperparameters --------------------------------------------------------
 SEED = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 42
@@ -150,11 +151,59 @@ scaler = Standardizer(train_data)
 u_train = transform(scaler, train_data)
 u_test = transform(scaler, test_data)
 
-W_in = 2 * sigma_in * (rand(rng, N, partial ? 1 : dim_system) .- 0.5)
+# --- LOBE VARIABLE ------------------------------------------------------------------
+# A slow bistable state s carrying WHICH LOBE of the Lorenz attractor we are on:
+#     ds/dt = gamma (s - s^3) + kappa * x_hat
+# Wells at s = +-1; x_hat (the predicted/true standardized x) changes sign between
+# lobes, so s follows lobe identity with hysteresis rather than tracking x.
+# It is fed back as an extra reservoir input channel and added to the readout
+# features, so the fast FHN network handles intra-lobe motion while s carries the
+# discrete lobe decision and the switching.
+#
+# NOTE the Lorenz lobe centres C+- = (+-8.49, +-8.49, 27) are UNSTABLE saddle-foci,
+# not attractors, so s's stable wells encode lobe IDENTITY, not the lobe centres
+# themselves -- putting stable attractors at C+- would freeze the forecast in a lobe.
+use_lobe = "lobe" in ARGS
+gl_arg = findfirst(a -> startswith(a, "gamma_lobe="), ARGS)
+kl_arg = findfirst(a -> startswith(a, "kappa_lobe="), ARGS)
+gamma_lobe = gl_arg === nothing ? 2.0 : parse(Float64, ARGS[gl_arg][12:end])
+kappa_lobe = kl_arg === nothing ? 1.0 : parse(Float64, ARGS[kl_arg][12:end])
+
+"Integrate the lobe variable over a known driving series `xs` (RK2, step dt)."
+function lobe_series(xs::AbstractVector, dt, gamma, kappa; s0 = 0.0)
+    s = s0
+    out = similar(xs, Float64)
+    @inbounds for i in eachindex(xs)
+        f1 = gamma * (s - s^3) + kappa * xs[i]
+        sm = s + 0.5dt * f1
+        f2 = gamma * (sm - sm^3) + kappa * xs[i]
+        s = clamp(s + dt * f2, -3.0, 3.0)
+        out[i] = s
+    end
+    return out
+end
+lobe_step(s, xhat, dt, gamma, kappa) = begin
+    f1 = gamma * (s - s^3) + kappa * xhat
+    sm = s + 0.5dt * f1
+    f2 = gamma * (sm - sm^3) + kappa * xhat
+    clamp(s + dt * f2, -3.0, 3.0)
+end
+
+dim_in = (partial ? 1 : dim_system) + (use_lobe ? 1 : 0)
+W_in = 2 * sigma_in * (rand(rng, N, dim_in) .- 0.5)
 a_fhn = a_lo .+ (a_hi - a_lo) .* rand(rng, N)   # heterogeneous node thresholds
 
 # --- drive the reservoir with the training signal (teacher forcing) ---------------
-G_train = W_in * (partial ? u_train[:, 1:1]' : u_train')   # N x n_train input currents
+s_train = use_lobe ? lobe_series(u_train[:, 1], dt, gamma_lobe, kappa_lobe) :
+                     zeros(size(u_train, 1))
+if use_lobe
+    @printf("Lobe variable: gamma=%.2f kappa=%.2f  mean|s|=%.2f  sign flips=%d\n",
+            gamma_lobe, kappa_lobe, mean(abs, s_train),
+            count(i -> sign(s_train[i]) != sign(s_train[i - 1]), 2:length(s_train)))
+end
+U_drive = partial ? u_train[:, 1:1]' : u_train'
+use_lobe && (U_drive = vcat(U_drive, s_train'))
+G_train = W_in * U_drive                                   # N x n_train input currents
 input_train = make_lerp(t_train, G_train)
 fhn_train! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input_train)
 
@@ -186,6 +235,29 @@ delay_features(S, idx) = vcat(S[:, idx], S[:, idx .- d_steps], S[:, idx .- 2d_st
 n_tr = size(R_train, 2)
 F_train = delay_features(R_train, washout:n_tr)   # washout > 2*delay_steps
 
+# --- lobe DETECTOR: read lobe identity off the RESERVOIR, not off the output -------
+# Driving s with the model's own predicted x is circular: once the forecast
+# degrades, s switches at the wrong times and inherits the failure instead of
+# correcting it. `lobe_res` instead fits a dedicated linear detector from the
+# reservoir features to the lobe state, so s has a handle on which lobe the
+# SUBSTRATE is in, independent of the main readout's error.
+lobe_from_res = "lobe_res" in ARGS
+lobe_detect = nothing
+if use_lobe && lobe_from_res
+    fs_mu = vec(mean(F_train, dims = 2))
+    fs_sd = vec(std(F_train, dims = 2)) .+ 1e-8
+    Fz = (F_train .- fs_mu) ./ fs_sd
+    s_tgt = s_train[washout:n_tr]
+    W_s = ((Fz * Fz' + 1e-2 * I) \ (Fz * s_tgt))'          # 1 x 6N
+    ŝ_fit = vec(W_s * Fz)
+    @printf("Lobe detector: train corr(s_hat, s) = %.4f, sign agreement = %.3f\n",
+            cor(ŝ_fit, s_tgt), mean(sign.(ŝ_fit) .== sign.(s_tgt)))
+    global lobe_detect = f -> (W_s * ((f .- fs_mu) ./ fs_sd))[1]
+end
+
+# the lobe state is part of the readout's input, so it can use lobe identity directly
+use_lobe && (F_train = vcat(F_train, s_train[washout:n_tr]'))
+
 # --- readout: delayed reservoir features at t_i -> Lorenz state at t_i -----------------
 # `readout` accepts a feature vector or a matrix of feature columns.
 if readout_kind === :ridge
@@ -204,7 +276,7 @@ if readout_kind === :ridge
 else
     aug(f::AbstractMatrix) = use_quad ? vcat(f, f .^ 2) : f
     aug(f::AbstractVector) = use_quad ? vcat(f, f .^ 2) : f
-    n_feat = 6N * (use_quad ? 2 : 1)
+    n_feat = (6N + (use_lobe ? 1 : 0)) * (use_quad ? 2 : 1)
 
     X_feat = Float32.(aug(F_train))
     Y_targ = Float32.(u_train[washout:n_tr, :]')
@@ -248,12 +320,22 @@ function fhn_closed_loop_forecast(r_start, x_start, n_steps)
     # delayed features; seeded from the end of the training run
     hist = R_train[:, (end - 2d_steps):end]
     x = copy(x_start)
+    s = use_lobe ? s_train[end] : 0.0     # continue the lobe state from training
     for i in 1:n_steps
-        g_ref[] = W_in * (partial ? x[1:1] : x)
+        drive = partial ? x[1:1] : x
+        use_lobe && (drive = vcat(drive, s))
+        g_ref[] = W_in * drive
         step!(integ, dt, true)
         hist = hcat(hist[:, 2:end], integ.u)
-        feats = vcat(hist[:, end], hist[:, end - d_steps], hist[:, end - 2d_steps])
+        feats_res = vcat(hist[:, end], hist[:, end - d_steps], hist[:, end - 2d_steps])
+        feats = use_lobe ? vcat(feats_res, s) : feats_res
         x = clamp.(readout(feats), -5.0, 5.0)
+        if use_lobe
+            # drive s either from the reservoir (lobe_res, independent of the
+            # readout's error) or from the model's own predicted x (circular)
+            drive_s = lobe_from_res ? lobe_detect(feats_res) : x[1]
+            s = lobe_step(s, drive_s, dt, gamma_lobe, kappa_lobe)
+        end
         pred[i, :] = x
     end
     return pred
@@ -265,7 +347,11 @@ pred_closed_n = fhn_closed_loop_forecast(r_end, x_end, length(t_test))
 X_pred_closed = inverse_transform(scaler, pred_closed_n)
 
 # --- open-loop (teacher-forced) one-step prediction, for comparison only --------------
-G_test = W_in * (partial ? u_test[:, 1:1]' : u_test')
+s_test = use_lobe ? lobe_series(u_test[:, 1], dt, gamma_lobe, kappa_lobe;
+                                s0 = s_train[end]) : zeros(size(u_test, 1))
+U_test_drive = partial ? u_test[:, 1:1]' : u_test'
+use_lobe && (U_test_drive = vcat(U_test_drive, s_test'))
+G_test = W_in * U_test_drive
 input_test = make_lerp(t_test, G_test)
 fhn_test! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input_test)
 prob_test = ODEProblem(fhn_test!, r_end, (t_test[1], t_test[end]))
@@ -275,6 +361,7 @@ sol_test = solve(prob_test, Tsit5(); saveat = t_test,
 # first test sample onward
 R_ext = hcat(R_train[:, (end - 2d_steps + 1):end], Array(sol_test))
 F_test = delay_features(R_ext, (2d_steps + 1):size(R_ext, 2))
+use_lobe && (F_test = vcat(F_test, s_test'))
 pred_open_n = readout(F_test)'
 X_pred_open = inverse_transform(scaler, Matrix(pred_open_n))
 

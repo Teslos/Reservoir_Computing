@@ -24,6 +24,7 @@ using Statistics
 using OrdinaryDiffEq
 using Flux
 using CairoMakie
+using Printf
 
 # --- hyperparameters --------------------------------------------------------
 SEED = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 42
@@ -37,6 +38,8 @@ SEED = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 42
 topology = isempty(ARGS) ? :erdos_renyi : Symbol(ARGS[1])
 save_figures = !("nofigs" in ARGS)
 readout_kind = "ridge" in ARGS ? :ridge : :nn
+# EXPERIMENT A: `deriv` trains the readout on du/dt and integrates it in the loop.
+deriv_readout = "deriv" in ARGS
 use_quad = "quad" in ARGS   # augment NN features with [f; f^2]
 partial  = "partial" in ARGS  # observe only x(t); y and z reconstructed from history
 hidden_arg = findfirst(a -> startswith(a, "hidden="), ARGS)
@@ -48,10 +51,7 @@ ridge_beta = beta_arg === nothing ? 1e-4 : parse(Float64, ARGS[beta_arg][6:end])
 coupling_arg = findfirst(a -> startswith(a, "coupling="), ARGS)
 # sigma_in scaling, settable as e.g. `sigma_in=2.0` on the command line
 sigma_in_arg = findfirst(a -> startswith(a, "sigma_in="), ARGS)
-# reservoir size, settable as e.g. `nodes=64` on the command line (the June
-# topology comparison in figures/ was run at 64; the paper's Lorenz section at 256)
-nodes_arg = findfirst(a -> startswith(a, "nodes="), ARGS)
-n_nodes = nodes_arg === nothing ? 256 : parse(Int, ARGS[nodes_arg][7:end])
+n_nodes = 256
 dim_system = 3
 sigma_in = sigma_in_arg === nothing ? 1.5 : parse(Float64, ARGS[sigma_in_arg][10:end])
 washout = 500             # discard the first 5 s of reservoir transients
@@ -62,20 +62,14 @@ delay_steps = 10          # time-delay embedding: the readout sees
 
 # FitzHugh-Nagumo parameters
 eps_fhn = 0.05            # time-scale separation
-# Settable as `a_lo=1.05 a_hi=1.30` to move the population across the Hopf
-# bifurcation: a > 1 is excitable (quiescent when undriven), a < 1 self-oscillates.
-a_lo_arg = findfirst(a -> startswith(a, "a_lo="), ARGS)
-a_hi_arg = findfirst(a -> startswith(a, "a_hi="), ARGS)
-a_lo = a_lo_arg === nothing ? 0.95 : parse(Float64, ARGS[a_lo_arg][6:end])
-a_hi = a_hi_arg === nothing ? 1.10 : parse(Float64, ARGS[a_hi_arg][6:end])
-                          # Defaults U(0.95, 1.1) straddle the Hopf bifurcation at
-                          # |a| = 1: a mixed population of weakly self-oscillating
-                          # (a < 1) and barely excitable (a > 1) nodes. The stated
-                          # rationale was that some intrinsic drive lets the
-                          # autonomous closed loop sustain a Lorenz-like climate,
-                          # since purely excitable nodes decay to quiescence once
-                          # the forecast diverges. The sweep over a_lo/a_hi tests
-                          # that rationale directly.
+a_lo, a_hi = 0.95, 1.1    # per-node threshold a_i ~ U(a_lo, a_hi), straddling
+                          # the Hopf bifurcation at |a| = 1: a mixed population
+                          # of weakly self-oscillating (a < 1) and barely
+                          # excitable (a > 1) nodes. Maximizes susceptibility
+                          # to the input while keeping some intrinsic drive,
+                          # so the autonomous closed loop can sustain a
+                          # Lorenz-like climate (purely excitable nodes decay
+                          # to quiescence once the forecast diverges)
 coupling = 0.3            # total in-coupling per node (degree-normalized)
 R0 = 0.5                  # input coupling into the slow variable
 speed = 20.0              # global time-scale factor: matches the oscillator
@@ -207,7 +201,20 @@ else
     n_feat = 6N * (use_quad ? 2 : 1)
 
     X_feat = Float32.(aug(F_train))
-    Y_targ = Float32.(u_train[washout:n_tr, :]')
+    # EXPERIMENT A ("deriv"): train the readout on the VECTOR FIELD du/dt rather
+    # than on the state u(t). The closed loop then INTEGRATES the learned field,
+    # which builds in the identity path that the discrete baseline gets for free
+    # by passing u_t through to its readout. This is the change that lifted the
+    # LPCTESN from 1.15 to 2.42 Lyapunov times.
+    if deriv_readout
+        Udot = similar(u_train)
+        Udot[2:end-1, :] = (u_train[3:end, :] .- u_train[1:end-2, :]) ./ (2dt)
+        Udot[1, :]   = (u_train[2, :]   .- u_train[1, :])     ./ dt
+        Udot[end, :] = (u_train[end, :] .- u_train[end-1, :]) ./ dt
+        Y_targ = Float32.(Udot[washout:n_tr, :]')
+    else
+        Y_targ = Float32.(u_train[washout:n_tr, :]')
+    end
 
     model = Chain(Dense(n_feat => n_hidden, tanh), Dense(n_hidden => dim_system))
     opt_state = Flux.setup(Adam(learning_rate), model)
@@ -253,10 +260,42 @@ function fhn_closed_loop_forecast(r_start, x_start, n_steps)
         step!(integ, dt, true)
         hist = hcat(hist[:, 2:end], integ.u)
         feats = vcat(hist[:, end], hist[:, end - d_steps], hist[:, end - 2d_steps])
-        x = clamp.(readout(feats), -5.0, 5.0)
+        if deriv_readout
+            # integrate the learned vector field instead of reading the state off
+            x = clamp.(x .+ dt .* vec(readout(feats)), -5.0, 5.0)
+        else
+            x = clamp.(readout(feats), -5.0, 5.0)
+        end
         pred[i, :] = x
     end
     return pred
+end
+
+# --- EXPERIMENT B: the reservoir's OWN autonomous dynamics, no feedback at all -------
+# Integrate the reservoir from the same synchronized state with the input current
+# held at ZERO, then read it out. If this matches what the closed loop settles into
+# after it diverges, the closed-loop failure is the network relaxing onto its own
+# attractor rather than an accumulation of readout error.
+function fhn_free_run(r_start, n_steps)
+    zero_in = zeros(N)
+    fhn_free! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, t -> zero_in)
+    prob = ODEProblem(fhn_free!, copy(r_start), (0.0, n_steps * dt))
+    integ = init(prob, Tsit5(); abstol = 1e-6, reltol = 1e-6, save_everystep = false)
+    hist = R_train[:, (end - 2d_steps):end]
+    out = zeros(n_steps, dim_system)
+    xacc = zeros(dim_system)
+    for i in 1:n_steps
+        step!(integ, dt, true)
+        hist = hcat(hist[:, 2:end], integ.u)
+        feats = vcat(hist[:, end], hist[:, end - d_steps], hist[:, end - 2d_steps])
+        if deriv_readout
+            xacc = clamp.(xacc .+ dt .* vec(readout(feats)), -5.0, 5.0)
+            out[i, :] = xacc
+        else
+            out[i, :] = clamp.(readout(feats), -5.0, 5.0)
+        end
+    end
+    return out
 end
 
 r_end = R_train[:, end]                  # synchronized state at the end of training
@@ -275,7 +314,27 @@ sol_test = solve(prob_test, Tsit5(); saveat = t_test,
 # first test sample onward
 R_ext = hcat(R_train[:, (end - 2d_steps + 1):end], Array(sol_test))
 F_test = delay_features(R_ext, (2d_steps + 1):size(R_ext, 2))
-pred_open_n = readout(F_test)'
+if deriv_readout
+    # With a derivative readout the readout returns du/dt, so reading it off
+    # directly would compare a velocity against a position (that mistake made
+    # mse_open ~ 4400 and put a +-300 trace on the state axes). The teacher-forced
+    # analogue is to INTEGRATE the learned field while the reservoir is still
+    # driven by the true signal. This isolates the accuracy of the field itself
+    # from the compounding of feedback error in the closed loop.
+    pred_open_n = let Fd = readout(F_test)   # dim_system x n_test, du/dt
+        n_te = size(Fd, 2)
+        Xo = zeros(n_te, dim_system)
+        xo = copy(u_train[end, :])           # start from the last known true state
+        for i in 1:n_te
+            xo = clamp.(xo .+ dt .* vec(Fd[:, i]), -5.0, 5.0)
+            Xo[i, :] = xo
+        end
+        Xo          # already n_test x dim_system, i.e. the same orientation the
+                    # non-deriv branch reaches via readout(F_test)'
+    end
+else
+    pred_open_n = readout(F_test)'
+end
 X_pred_open = inverse_transform(scaler, Matrix(pred_open_n))
 
 # --- evaluation -------------------------------------------------------------------------
@@ -289,6 +348,31 @@ println("Closed-loop MSE over the first Lyapunov time: ", mse_1lyap)
 println("Open-loop (teacher-forced) MSE over the whole test set: ", mse_open)
 
 # machine-readable summary line for seed sweeps
+# --- EXPERIMENT B evaluation ---------------------------------------------------------
+# Compare the free-running reservoir against the closed loop AFTER it has diverged.
+# Similar statistics there mean the closed loop has fallen onto the reservoir's own
+# attractor; dissimilar means the failure is something else.
+let n_free = length(t_test)
+    X_free_n = fhn_free_run(r_end, n_free)
+    X_free = inverse_transform(scaler, X_free_n)
+    i0 = max(1, round(Int, 2.0 / dt))          # well past t* (~0.25 s) -- use t > 2 s
+    tail_closed = X_pred_closed[i0:end, :]
+    tail_free   = X_free[i0:end, :]
+    m_c = vec(mean(tail_closed, dims = 1)); s_c = vec(std(tail_closed, dims = 1))
+    m_f = vec(mean(tail_free,   dims = 1)); s_f = vec(std(tail_free,   dims = 1))
+    m_t = vec(mean(test_data[i0:end, :], dims = 1))
+    s_t = vec(std(test_data[i0:end, :],  dims = 1))
+    @printf("EXPT-B truth      mean=(%.2f,%.2f,%.2f) std=(%.2f,%.2f,%.2f)\n",
+            m_t[1], m_t[2], m_t[3], s_t[1], s_t[2], s_t[3])
+    @printf("EXPT-B closedloop mean=(%.2f,%.2f,%.2f) std=(%.2f,%.2f,%.2f)\n",
+            m_c[1], m_c[2], m_c[3], s_c[1], s_c[2], s_c[3])
+    @printf("EXPT-B freerun    mean=(%.2f,%.2f,%.2f) std=(%.2f,%.2f,%.2f)\n",
+            m_f[1], m_f[2], m_f[3], s_f[1], s_f[2], s_f[3])
+    @printf("EXPT-B rms(closed-free)=%.3f   rms(closed-truth)=%.3f\n",
+            sqrt(mean(abs2, tail_closed .- tail_free)),
+            sqrt(mean(abs2, tail_closed .- test_data[i0:end, :])))
+end
+
 println("RESULT topology=$topology seed=$SEED readout=$readout_kind ",
         readout_kind === :ridge ? "beta=$ridge_beta " : "",
         readout_kind === :nn && use_quad ? "quad=true " : "",
@@ -304,8 +388,11 @@ if save_figures
 
     # --- plots -----------------------------------------------------------------------------
     pfx = partial ? "_partial" : ""
-    suffix = readout_kind === :ridge ? "$(topology)_ridge$(pfx)" :
-             use_quad ? "$(topology)_nn_quad$(pfx)" : "$(topology)$(pfx)"
+    # `_deriv` keeps the derivative-readout figures from overwriting the
+    # observer-readout ones, which share topology and readout kind.
+    dsfx = deriv_readout ? "_deriv" : ""
+    suffix = (readout_kind === :ridge ? "$(topology)_ridge$(pfx)" :
+              use_quad ? "$(topology)_nn_quad$(pfx)" : "$(topology)$(pfx)") * dsfx
     plot_forecast(t_test, test_data, X_pred_closed,
                   "figures/lorenz_FHN_NN_$(suffix).png";
                   pred_open_loop = X_pred_open, t_valid = t_valid,
