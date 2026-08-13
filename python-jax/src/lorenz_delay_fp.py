@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxopt import LBFGS
+from jax.scipy.linalg import expm
 
 jax.config.update("jax_enable_x64", True)
 LYAPUNOV = 0.9056
@@ -74,8 +75,31 @@ def standardized_jacobians(fixed, mu, sd):
     return jax.vmap(jax.jacfwd(rhs_z))(fixed)
 
 
-def losses(params, projection, delays_x, deriv_y, local_x, local_y, fixed, target_jac,
-           fp_weight, local_weight, jac_weight, l2_weight):
+def physical_tangent_maps(target_jac, delays, stride, dt):
+    """Exact discrete flow and physically consistent delay tangent embeddings.
+
+    A perturbation q at the current time has lagged copies A^(-k*stride) q,
+    where A=exp(dt*J) is the true local Lorenz flow. Thus E maps a current
+    three-dimensional perturbation into the full delay coordinates.
+    """
+    lag_steps = jnp.arange(delays) * stride
+
+    def build(jac):
+        advance = expm(dt * jac)
+        blocks = jax.vmap(lambda lag: expm(-dt * lag * jac))(lag_steps)
+        embedding = blocks.reshape(3 * delays, 3)
+        # Backward evolution along forward-stable modes can grow enormously
+        # over a long delay window. Normalize each tangent basis column while
+        # scaling its target identically; this preserves the linear constraint.
+        scale = jnp.linalg.norm(embedding, axis=0)
+        return advance / scale[None, :], embedding / scale[None, :]
+
+    return jax.vmap(build)(target_jac)
+
+
+def losses(params, projection, delays_x, deriv_y, local_x, local_y, fixed,
+           target_jac, tangent_advance, tangent_embedding, fp_weight,
+           local_weight, tangent_weight, jac_weight, l2_weight):
     pred = predict(params, projection, delays_x)
     data_loss = jnp.mean((pred - deriv_y) ** 2)
 
@@ -88,10 +112,22 @@ def losses(params, projection, delays_x, deriv_y, local_x, local_y, fixed, targe
     local_loss = jnp.mean((predict(params, projection, local_x) - local_y) ** 2)
     learned_jac = jax.vmap(jax.jacfwd(equilibrium_field))(fixed)
     jac_loss = jnp.mean((learned_jac - target_jac) ** 2)
+
+    def tangent_residual(z, advance, embedding):
+        repeated = jnp.tile(z, delays_x.shape[1] // 3)
+        # The autonomous update is x+ = x + dt*g(delay). Its derivative along
+        # a physically consistent delay perturbation E q must equal A q.
+        dg_ddelay = jax.jacfwd(lambda d: predict(params, projection, d))(repeated)
+        current_perturbation = embedding[:3, :]
+        learned_advance = current_perturbation + 0.01 * (dg_ddelay @ embedding)
+        return learned_advance - advance
+
+    tangent_error = jax.vmap(tangent_residual)(fixed, tangent_advance, tangent_embedding)
+    tangent_loss = jnp.mean(tangent_error ** 2)
     l2 = sum(jnp.mean(p**2) for p in params)
     total = (data_loss + fp_weight*fp_loss + local_weight*local_loss
-             + jac_weight*jac_loss + l2_weight*l2)
-    return total, (data_loss, fp_loss, local_loss, jac_loss)
+             + tangent_weight*tangent_loss + jac_weight*jac_loss + l2_weight*l2)
+    return total, (data_loss, fp_loss, local_loss, tangent_loss, jac_loss)
 
 
 def local_equilibrium_data(key, fixed, mu, sd, delays, stride,
@@ -135,14 +171,17 @@ def local_equilibrium_data(key, fixed, mu, sd, delays, stride,
     return lx.reshape(-1, 3*delays).astype(jnp.float32), ly.reshape(-1, 3).astype(jnp.float32)
 
 
-def adam_train(key, params, projection, x, y, local_x, local_y, fixed, target_jac, args):
+def adam_train(key, params, projection, x, y, local_x, local_y, fixed,
+               target_jac, tangent_advance, tangent_embedding, args):
     zeros = jax.tree.map(jnp.zeros_like, params)
     state = (zeros, zeros, jnp.array(0))
 
     @jax.jit
     def update(p, opt, xb, yb):
-        fn = lambda pp: losses(pp, projection, xb, yb, local_x, local_y, fixed, target_jac,
-                               args.fp_weight, args.local_weight, args.jac_weight, args.l2)[0]
+        fn = lambda pp: losses(
+            pp, projection, xb, yb, local_x, local_y, fixed, target_jac,
+            tangent_advance, tangent_embedding, args.fp_weight, args.local_weight,
+            args.tangent_weight, args.jac_weight, args.l2)[0]
         value, grad = jax.value_and_grad(fn)(p)
         m, v, t = opt; t += 1
         m = jax.tree.map(lambda a, g: .9*a + .1*g, m, grad)
@@ -185,6 +224,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--fp-weight", type=float, default=.1)
     p.add_argument("--local-weight", type=float, default=.05)
+    p.add_argument("--tangent-weight", type=float, default=.01,
+                   help="physical delay-manifold Jacobian weight")
     p.add_argument("--local-perturbations", type=int, default=32, help="true local trajectories per equilibrium")
     p.add_argument("--local-steps", type=int, default=25, help="supervised samples per local trajectory")
     p.add_argument("--local-radius-min", type=float, default=1e-6, help="minimum standardized perturbation")
@@ -222,6 +263,8 @@ def main():
     deriv_y = (train_z[offset+2:] - train_z[offset:-2])/(2*dt)
     fixed = true_fixed_points(mu, sd)
     target_jac = standardized_jacobians(fixed, mu, sd)
+    tangent_advance, tangent_embedding = physical_tangent_maps(
+        target_jac, args.delays, args.delay_stride, dt)
     local_x, local_y = local_equilibrium_data(
         jax.random.PRNGKey(args.seed+2), fixed, mu, sd, args.delays, args.delay_stride,
         args.local_perturbations, args.local_steps, args.local_radius_min,
@@ -231,23 +274,30 @@ def main():
     print(f"Frozen nonlinear lift: {delay_x.shape[1]} -> {args.lift}; readout hidden={args.hidden}")
     print(f"Equilibrium neighborhoods: {args.local_perturbations} trajectories/fixed point, "
           f"{args.local_steps} samples each, radii=[{args.local_radius_min:g}, {args.local_radius_max:g}]")
+    print(f"Physical tangent regularizer: weight={args.tangent_weight:g}, exact exp(dt*J) over "
+          f"{args.delays} delay blocks")
     params = adam_train(jax.random.PRNGKey(args.seed+1), params, projection,
                         delay_x.astype(jnp.float32), deriv_y.astype(jnp.float32),
-                        local_x, local_y, fixed, target_jac, args)
+                        local_x, local_y, fixed, target_jac,
+                        tangent_advance, tangent_embedding, args)
 
-    objective = lambda p: losses(p, projection, delay_x.astype(jnp.float32), deriv_y.astype(jnp.float32),
-                                 local_x, local_y, fixed, target_jac, args.fp_weight,
-                                 args.local_weight, args.jac_weight, args.l2)[0]
+    objective = lambda p: losses(
+        p, projection, delay_x.astype(jnp.float32), deriv_y.astype(jnp.float32),
+        local_x, local_y, fixed, target_jac, tangent_advance, tangent_embedding,
+        args.fp_weight, args.local_weight, args.tangent_weight, args.jac_weight, args.l2)[0]
     if not args.no_lbfgs and args.lbfgs_iterations:
         solver = LBFGS(objective, maxiter=args.lbfgs_iterations, history_size=10,
                        tol=1e-6, linesearch="zoom", jit=True)
         result = solver.run(params); params = result.params
         print(f"L-BFGS: iterations={int(result.state.iter_num)}, objective={float(result.state.value):.6g}, error={float(result.state.error):.3g}")
 
-    total, parts = losses(params, projection, delay_x, deriv_y, local_x, local_y, fixed, target_jac,
-                          args.fp_weight, args.local_weight, args.jac_weight, args.l2)
+    total, parts = losses(
+        params, projection, delay_x, deriv_y, local_x, local_y, fixed, target_jac,
+        tangent_advance, tangent_embedding, args.fp_weight, args.local_weight,
+        args.tangent_weight, args.jac_weight, args.l2)
     print(f"Final losses: total={float(total):.6g} data={float(parts[0]):.6g} "
-          f"fixed_point={float(parts[1]):.6g} local={float(parts[2]):.6g} jacobian={float(parts[3]):.6g}")
+          f"fixed_point={float(parts[1]):.6g} local={float(parts[2]):.6g} "
+          f"tangent={float(parts[3]):.6g} legacy_jacobian={float(parts[4]):.6g}")
 
     history0 = train_z[-((args.delays-1)*args.delay_stride+1):]
     @functools.partial(jax.jit, static_argnums=(2,))
@@ -264,9 +314,11 @@ def main():
     seconds, lyap = valid_time(test, pred, dt)
     print(f"Closed-loop valid prediction time: {seconds:.2f} s ({lyap:.3f} Lyapunov times)")
     print(f"RESULT seed={args.seed} delays={args.delays} stride={args.delay_stride} lift={args.lift} hidden={args.hidden} "
-          f"fp_weight={args.fp_weight:g} local_weight={args.local_weight:g} jac_weight={args.jac_weight:g} "
+          f"fp_weight={args.fp_weight:g} local_weight={args.local_weight:g} "
+          f"tangent_weight={args.tangent_weight:g} jac_weight={args.jac_weight:g} "
           f"t_valid_s={seconds:.3f} t_valid_lyap={lyap:.3f} fp_loss={float(parts[1]):.6g} "
-          f"local_loss={float(parts[2]):.6g} jac_loss={float(parts[3]):.6g}")
+          f"local_loss={float(parts[2]):.6g} tangent_loss={float(parts[3]):.6g} "
+          f"jac_loss={float(parts[4]):.6g}")
 
     if not args.no_figs:
         import matplotlib.pyplot as plt

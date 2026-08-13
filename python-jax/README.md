@@ -56,15 +56,18 @@ conditional Lyapunov exponent is already optimal; override them with
 through a frozen high-dimensional random `tanh` projection, and learns a
 residual vector field. Its loss constrains all three Lorenz equilibria and uses
 short, physically consistent true-flow delay trajectories around them to teach
-their local stable/unstable dynamics. Adam is followed by a deterministic
-full-batch L-BFGS refinement.
+their local stable/unstable dynamics. A physical tangent regularizer additionally
+uses the exact discrete propagator `exp(dt J)` and consistent lag perturbations
+`exp(-k dt J)` to match the three-dimensional Lorenz tangent dynamics inside
+the full delay space. Adam is followed by deterministic full-batch L-BFGS.
 
 ```bash
 uv run lorenz-delay-fp --quick --no-figs --require-gpu
 uv run lorenz-delay-fp 42 --delays 16 --delay-stride 5 --lift 512 --require-gpu
 ```
 
-Ablate the geometry constraints with `--fp-weight 0 --local-weight 0`, or
+Ablate the geometry constraints with
+`--fp-weight 0 --local-weight 0 --tangent-weight 0`, or
 isolate the optimizer effect with `--no-lbfgs`. The old repeated-delay Jacobian
 penalty remains available through `--jac-weight`, but defaults to zero because
 it is not the full Jacobian of the autonomous delay-buffer map. The
