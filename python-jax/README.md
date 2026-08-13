@@ -49,3 +49,20 @@ population close to the Hopf boundary at `|a| = 1` while reducing collective
 synchronization. These are testable candidate settings, not a claim that the
 conditional Lyapunov exponent is already optimal; override them with
 `--coupling`, `--a-lo`, and `--a-hi` for sweeps.
+
+## Delay-lifted fixed-point experiment
+
+`lorenz-delay-fp` builds delay coordinates directly from Lorenz-63, maps them
+through a frozen high-dimensional random `tanh` projection, and learns a
+residual vector field. Its loss constrains all three Lorenz equilibria and the
+Jacobian along the repeated-delay equilibrium manifold. Adam is followed by a
+deterministic full-batch L-BFGS refinement.
+
+```bash
+uv run lorenz-delay-fp --quick --no-figs --require-gpu
+uv run lorenz-delay-fp 42 --delays 16 --delay-stride 5 --lift 512 --require-gpu
+```
+
+Ablate the geometry constraints with `--fp-weight 0 --jac-weight 0`, or isolate
+the optimizer effect with `--no-lbfgs`. The machine-readable `RESULT` line
+reports forecast Lyapunov time plus fixed-point and Jacobian residuals.

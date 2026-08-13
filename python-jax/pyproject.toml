@@ -7,16 +7,18 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
   "jax[cuda13]>=0.7,<0.10; sys_platform == 'linux'",
   "jax>=0.7,<0.10; sys_platform != 'linux'",
+  "jaxopt>=0.8.5",
   "matplotlib>=3.10",
   "numpy>=2.2",
 ]
 
 [project.scripts]
 rc-fhn-jax = "rc_fhn_jax:main"
+lorenz-delay-fp = "lorenz_delay_fp:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/rc_fhn_jax.py"]
+packages = ["src/rc_fhn_jax.py", "src/lorenz_delay_fp.py"]
