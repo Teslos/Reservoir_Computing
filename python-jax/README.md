@@ -83,3 +83,19 @@ excluded from all fitting and reports median, lower-quartile, and worst-case
 Lyapunov times. Use `--rollout-epochs 0` for the old one-step-only workflow.
 `--projection-seed`, `--network-seed`, and `--local-seed` independently control
 the frozen lift, readout initialization, and equilibrium trajectories.
+
+Use `--lift-kind polynomial` to replace the random `tanh` projection with a
+deterministic degree-2 dictionary containing every delay coordinate and every
+unique pairwise product. With 48 delay coordinates this produces 1,224 features
+and directly includes the quadratic `xy` and `xz` structure of Lorenz-63. The
+random lift remains the default for backward-compatible comparisons.
+
+```bash
+uv run lorenz-delay-fp 44 --lift-kind polynomial \
+  --network-seed 43 --local-seed 44 --no-figs --require-gpu
+```
+
+For the most interpretable control, use `--hidden 0`: this fits the vector field
+directly as a linear combination of the quadratic dictionary. Lorenz-63 itself
+is quadratic, so this model class contains its exact vector-field form without
+a random projection or hidden nonlinear layer.

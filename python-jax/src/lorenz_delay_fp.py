@@ -44,22 +44,47 @@ def delay_vectors(x, delays, stride):
     return x[ids].reshape(len(x) - offset, 3 * delays), offset
 
 
-def init_model(key, input_dim, lift_dim, hidden):
+def lift_features(delay_flat, projection):
+    """Random tanh features, or a deterministic degree-2 polynomial dictionary."""
+    if projection.shape[0] != 0:
+        return jnp.tanh(delay_flat @ projection)
+    n = delay_flat.shape[-1]
+    ii, jj = jnp.triu_indices(n)
+    quadratic = delay_flat[..., ii] * delay_flat[..., jj]
+    return jnp.concatenate((delay_flat, quadratic), axis=-1)
+
+
+def init_model(key, input_dim, lift_dim, hidden, lift_kind="random"):
     kp, k1, k2 = jax.random.split(key, 3)
-    # Frozen random nonlinear projection; sqrt scaling avoids immediate saturation.
-    projection = jax.random.normal(kp, (input_dim, lift_dim), dtype=jnp.float32) / jnp.sqrt(input_dim)
-    params = (jax.random.normal(k1, (lift_dim + 3, hidden), dtype=jnp.float32) / jnp.sqrt(lift_dim + 3),
-              jnp.zeros(hidden, jnp.float32),
-              jax.random.normal(k2, (hidden, 3), dtype=jnp.float32) / jnp.sqrt(hidden),
-              jnp.zeros(3, jnp.float32))
+    if lift_kind == "random":
+        # Frozen random nonlinear projection; sqrt scaling avoids saturation.
+        projection = jax.random.normal(kp, (input_dim, lift_dim), dtype=jnp.float32) / jnp.sqrt(input_dim)
+        feature_dim = lift_dim
+    else:
+        # Empty first dimension is a static sentinel for the polynomial branch.
+        projection = jnp.empty((0, 0), dtype=jnp.float32)
+        feature_dim = input_dim + input_dim * (input_dim + 1) // 2
+    if hidden > 0:
+        params = (jax.random.normal(k1, (feature_dim + 3, hidden), dtype=jnp.float32) / jnp.sqrt(feature_dim + 3),
+                  jnp.zeros(hidden, jnp.float32),
+                  jax.random.normal(k2, (hidden, 3), dtype=jnp.float32) / jnp.sqrt(hidden),
+                  jnp.zeros(3, jnp.float32))
+    else:
+        # Preserve a common pytree structure; empty W1 signals direct readout.
+        params = (jnp.empty((feature_dim + 3, 0), jnp.float32), jnp.empty((0,), jnp.float32),
+                  jax.random.normal(k2, (feature_dim + 3, 3), dtype=jnp.float32) / jnp.sqrt(feature_dim + 3),
+                  jnp.zeros(3, jnp.float32))
     return projection, params
 
 
 def predict(params, projection, delay_flat):
     w1, b1, w2, b2 = params
     current = delay_flat[..., :3]
-    lift = jnp.tanh(delay_flat @ projection)
-    return jnp.tanh(jnp.concatenate((lift, current), axis=-1) @ w1 + b1) @ w2 + b2
+    lift = lift_features(delay_flat, projection)
+    features = jnp.concatenate((lift, current), axis=-1)
+    if w1.shape[1] == 0:
+        return features @ w2 + b2
+    return jnp.tanh(features @ w1 + b1) @ w2 + b2
 
 
 def true_fixed_points(mu, sd):
@@ -124,7 +149,7 @@ def losses(params, projection, delays_x, deriv_y, local_x, local_y, fixed,
 
     tangent_error = jax.vmap(tangent_residual)(fixed, tangent_advance, tangent_embedding)
     tangent_loss = jnp.mean(tangent_error ** 2)
-    l2 = sum(jnp.mean(p**2) for p in params)
+    l2 = sum(jnp.mean(p**2) for p in params if p.size)
     total = (data_loss + fp_weight*fp_loss + local_weight*local_loss
              + tangent_weight*tangent_loss + jac_weight*jac_loss + l2_weight*l2)
     return total, (data_loss, fp_loss, local_loss, tangent_loss, jac_loss)
@@ -337,7 +362,10 @@ def parse_args():
     p.add_argument("--delays", type=int, default=16)
     p.add_argument("--delay-stride", type=int, default=5, help="samples between delays; dt=0.01 s")
     p.add_argument("--lift", type=int, default=512)
-    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--lift-kind", choices=("random", "polynomial"), default="random",
+                   help="random tanh lift or deterministic linear+quadratic dictionary")
+    p.add_argument("--hidden", type=int, default=256,
+                   help="readout hidden width; 0 selects a direct linear readout")
     p.add_argument("--adam-epochs", type=int, default=150)
     p.add_argument("--lbfgs-iterations", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=512)
@@ -376,6 +404,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.hidden < 0:
+        raise ValueError("--hidden must be non-negative")
     print(f"JAX {jax.__version__}; devices: {jax.devices()}; backend: {jax.default_backend()}")
     if args.require_gpu and jax.default_backend() != "gpu":
         raise RuntimeError("GPU required but CUDA was not detected")
@@ -413,10 +443,13 @@ def main():
         jax.random.PRNGKey(local_seed), fixed, mu, sd, args.delays, args.delay_stride,
         args.local_perturbations, args.local_steps, args.local_radius_min,
         args.local_radius_max, dt)
-    projection, _ = init_model(jax.random.PRNGKey(projection_seed), delay_x.shape[1], args.lift, args.hidden)
-    _, params = init_model(jax.random.PRNGKey(network_seed), delay_x.shape[1], args.lift, args.hidden)
+    projection, _ = init_model(jax.random.PRNGKey(projection_seed), delay_x.shape[1], args.lift, args.hidden, args.lift_kind)
+    _, params = init_model(jax.random.PRNGKey(network_seed), delay_x.shape[1], args.lift, args.hidden, args.lift_kind)
     print(f"Delay embedding: {args.delays} x 3, stride={args.delay_stride} ({args.delay_stride*dt:g} s), window={(args.delays-1)*args.delay_stride*dt:g} s")
-    print(f"Frozen nonlinear lift: {delay_x.shape[1]} -> {args.lift}; readout hidden={args.hidden}")
+    effective_lift = (args.lift if args.lift_kind == "random" else
+                      delay_x.shape[1] + delay_x.shape[1]*(delay_x.shape[1]+1)//2)
+    readout_label = "linear" if args.hidden == 0 else f"MLP({args.hidden})"
+    print(f"Feature lift: kind={args.lift_kind}, {delay_x.shape[1]} -> {effective_lift}; readout={readout_label}")
     print(f"Random seeds: projection={projection_seed}, network={network_seed}, local={local_seed}; "
           f"held-out tail={args.validation_seconds:g} s")
     print(f"Equilibrium neighborhoods: {args.local_perturbations} trajectories/fixed point, "
@@ -473,7 +506,9 @@ def main():
     print(f"Held-out multi-start Lyapunov times: median={np.median(val_lyap):.3f} "
           f"q25={np.quantile(val_lyap,.25):.3f} min={val_lyap.min():.3f} n={len(val_lyap)}")
     print(f"Closed-loop valid prediction time: {seconds:.2f} s ({lyap:.3f} Lyapunov times)")
-    print(f"RESULT seed={args.seed} delays={args.delays} stride={args.delay_stride} lift={args.lift} hidden={args.hidden} "
+    print(f"RESULT seed={args.seed} projection_seed={projection_seed} network_seed={network_seed} "
+          f"local_seed={local_seed} delays={args.delays} stride={args.delay_stride} "
+          f"lift_kind={args.lift_kind} lift={effective_lift} hidden={args.hidden} "
           f"fp_weight={args.fp_weight:g} local_weight={args.local_weight:g} "
           f"tangent_weight={args.tangent_weight:g} jac_weight={args.jac_weight:g} "
           f"t_valid_s={seconds:.3f} t_valid_lyap={lyap:.3f} fp_loss={float(parts[1]):.6g} "
