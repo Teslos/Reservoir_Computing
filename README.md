@@ -5,6 +5,10 @@ classification. The Julia code lives in `Reservoir-Computing-in-Julia/` and
 shares utilities through `common.jl` (Lorenz data, reservoir helpers, the valid-
 prediction-time metric, and the forecast / Lorenz-map plots).
 
+The GPU-accelerated Python/JAX port of the FHN example is in `python-jax/`.
+It is packaged with `uv` and targets the two NVIDIA GPUs on `thl06710`; see
+`python-jax/README.md` for setup and run commands.
+
 ## Lorenz-63 forecasters
 
 | Script | Reservoir |
