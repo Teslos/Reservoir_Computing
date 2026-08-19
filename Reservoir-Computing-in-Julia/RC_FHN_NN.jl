@@ -304,6 +304,9 @@ if save_figures
 
     # --- plots -----------------------------------------------------------------------------
     pfx = partial ? "_partial" : ""
+    pretty_topology = Dict(:erdos_renyi => "Erdos-Renyi", :barabasi_albert => "Barabasi-Albert",
+                           :watts_strogatz => "Watts-Strogatz", :complete => "complete",
+                           :grid => "grid")[topology]
     suffix = readout_kind === :ridge ? "$(topology)_ridge$(pfx)" :
              use_quad ? "$(topology)_nn_quad$(pfx)" : "$(topology)$(pfx)"
     plot_forecast(t_test, test_data, X_pred_closed,
@@ -314,7 +317,10 @@ if save_figures
     plot_forecast_3d(test_data, X_pred_closed,
                      "figures/lorenz3d_FHN_NN_$(suffix).png";
                      title = "FHN reservoir ($suffix): closed-loop forecast")
-    plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_FHN_NN_$(suffix).png")
+    # model/panel: panel b) of the return-map figure in the manuscript
+    plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_FHN_NN_$(suffix).png";
+                    model = "FHN reservoir, $(pretty_topology) ($n_nodes nodes)",
+                    panel = "b)")
     println("Figures written to figures/lorenz_FHN_NN_$(suffix).png, ",
             "figures/lorenz3d_FHN_NN_$(suffix).png, ",
             "figures/lorenz_map_FHN_NN_$(suffix).png, ",

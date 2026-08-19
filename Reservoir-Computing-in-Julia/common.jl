@@ -12,7 +12,8 @@ using CairoMakie   # also re-exports @L_str, used for the Lorenz-map axis labels
 export lorenz!, generate_lorenz_split, generate_reservoir, drive_reservoir,
        closed_loop_forecast, Standardizer, transform, inverse_transform,
        find_maxima_in_z, valid_prediction_time, LORENZ_LYAPUNOV,
-       make_lerp, plot_forecast, plot_forecast_3d, plot_lorenz_map
+       make_lerp, plot_forecast, plot_forecast_3d, plot_lorenz_map,
+       plot_maxima_map, save_maxima
 
 # Largest Lyapunov exponent of the Lorenz system at sigma=10, rho=28, beta=8/3.
 # 1/LORENZ_LYAPUNOV ~ 1.1 s is one "Lyapunov time".
@@ -229,26 +230,62 @@ function plot_forecast_3d(truth, pred, path::AbstractString;
 end
 
 """
-    plot_lorenz_map(truth_traj, pred_traj, path)
+    plot_lorenz_map(truth_traj, pred_traj, path; model, panel)
 
 Return map of successive z-maxima (the Lorenz map). A forecast that diverges
 pointwise can still reproduce this "climate" of the attractor.
+
+`model` names the reservoir in the title; without it two such panels placed side
+by side are indistinguishable. `panel` draws a tag ("a)", "b)") outside the axis,
+for figures that are referred to panel-wise in a caption.
+
+The maxima are also written next to the figure as CSV, so that a purely cosmetic
+change to this plot does not require rerunning the whole experiment.
 """
-function plot_lorenz_map(truth_traj, pred_traj, path::AbstractString)
-    fig = Figure(size = (700, 600))
-    # LaTeX strings: as plain strings the axis labels rendered the underscore
-    # literally ("z_n", "z_n+1") instead of subscripting it.
-    ax = Axis(fig[1, 1], title = "Lorenz map (successive z-maxima)",
-              xlabel = L"z_n", ylabel = L"z_{n+1}")
+function plot_lorenz_map(truth_traj, pred_traj, path::AbstractString;
+                         model::AbstractString = "", panel::AbstractString = "")
     mt = find_maxima_in_z(truth_traj)
     mp = find_maxima_in_z(pred_traj)
+    save_maxima(replace(path, r"(?i)\.(png|pdf)$" => ".maxima.csv"), mt, mp)
+    return plot_maxima_map(mt, mp, path; model = model, panel = panel)
+end
+
+"""
+    plot_maxima_map(mt, mp, path; model, panel)
+
+Draw the return map from precomputed maxima. Split out from `plot_lorenz_map` so
+that the figure can be redrawn from the saved CSV without rerunning the forecast.
+"""
+function plot_maxima_map(mt, mp, path::AbstractString;
+                         model::AbstractString = "", panel::AbstractString = "")
+    fig = Figure(size = (700, 600))
+    # When the model is named the generic phrase is left to the caption, which
+    # already says what the map is; repeating it here only shrinks the useful text.
+    # LaTeX strings: as plain strings the axis labels rendered the underscore
+    # literally ("z_n", "z_n+1") instead of subscripting it.
+    ax = Axis(fig[1, 1],
+              title = isempty(model) ? "Lorenz map (successive z-maxima)" : model,
+              xlabel = L"z_n", ylabel = L"z_{n+1}")
     scatter!(ax, mt[1:(end - 1)], mt[2:end], color = (:black, 0.6),
              markersize = 7, label = "True")
     scatter!(ax, mp[1:(end - 1)], mp[2:end], color = (:red, 0.6),
              markersize = 7, label = "Predicted")
     axislegend(ax, position = :lt)
+    # panel tag OUTSIDE the axis, so it cannot collide with the scatter
+    isempty(panel) || Label(fig[1, 1, TopLeft()], panel; fontsize = 18,
+                            font = :bold, padding = (0, 6, 4, 0), halign = :left)
     save_vector(path, fig)
     return fig
+end
+
+"Write the true and predicted z-maxima as long-form CSV (series,index,z)."
+function save_maxima(path::AbstractString, mt, mp)
+    open(path, "w") do io
+        println(io, "series,index,z")
+        for (k, z) in enumerate(mt); println(io, "true,", k, ",", z); end
+        for (k, z) in enumerate(mp); println(io, "pred,", k, ",", z); end
+    end
+    return path
 end
 
 end # module

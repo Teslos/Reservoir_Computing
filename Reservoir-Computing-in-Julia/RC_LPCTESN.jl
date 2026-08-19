@@ -37,6 +37,10 @@ save_figures = !("nofigs" in ARGS)
 # "discrete vs continuous reservoir".
 quad = "quad" in ARGS
 phi(r) = quad ? vcat(r, r .^ 2) : r           # readout feature map
+# `partial` feeds only x(t) to the reservoir; y and z must be reconstructed
+# from x-history via the fading-memory property (Takens embedding theorem).
+partial = "partial" in ARGS
+observe(x) = partial ? x[1:1] : x             # which components drive the reservoir
 
 NR = quick ? 150 : 300          # reservoir size
 dim_system = 3
@@ -67,13 +71,14 @@ scaler = Standardizer(train_data)
 u_train = transform(scaler, train_data)
 
 A = generate_reservoir(rng, NR, density; spectral_radius)
-W_in = 2 * sigma_in .* (rand(rng, NR, dim_system) .- 0.5)
+W_in = 2 * sigma_in .* (rand(rng, NR, partial ? 1 : dim_system) .- 0.5)
 
 # --- teacher-forced continuous reservoir ------------------------------------
 reservoir_rhs(input) = (dr, r, p, t) ->
     (dr .= speed .* (-leak .* r .+ tanh.(A * r .+ input(t))); nothing)
 
-input_train = make_lerp(t_tr, W_in * u_train')        # NR-vector current g(t)
+u_obs_train = partial ? u_train[:, 1:1]' : u_train'   # observed components
+input_train = make_lerp(t_tr, W_in * u_obs_train)     # NR-vector current g(t)
 sol_tr = solve(ODEProblem(reservoir_rhs(input_train), zeros(NR), (t_tr[1], t_tr[end])),
                Tsit5(); saveat = t_tr, abstol = 1e-6, reltol = 1e-6)
 R_train = Array(sol_tr)                                # NR x n_train
@@ -91,7 +96,7 @@ println("Readout ($(quad ? "quadratic" : "linear")) training MSE (standardized):
 
 # --- closed-loop (autonomous) forecast: still a smooth ODE in r --------------
 closed_rhs(dr, r, p, t) =
-    (dr .= speed .* (-leak .* r .+ tanh.(A * r .+ W_in * readout_std(r))); nothing)
+    (dr .= speed .* (-leak .* r .+ tanh.(A * r .+ W_in * observe(readout_std(r)))); nothing)
 
 reconstruct(sol) = quad ?
     (W_out * ((vcat(Array(sol), Array(sol) .^ 2) .- f_mu) ./ f_sd))' :
@@ -110,12 +115,12 @@ X_pred = predict_closed(t_te)
 t_valid, t_valid_lyap = valid_prediction_time(test_data, X_pred, t_te)
 println("LPCTESN closed-loop valid prediction time: $(round(t_valid, digits = 2)) s ",
         "($(round(t_valid_lyap, digits = 2)) Lyapunov times)")
-println("RESULT method=LPCTESN$(quad ? "_quad" : "") seed=$SEED NR=$NR ",
+println("RESULT method=LPCTESN$(quad ? "_quad" : "")$(partial ? "_partial" : "") seed=$SEED NR=$NR ",
         "t_valid_s=$(round(t_valid, digits = 3)) t_valid_lyap=$(round(t_valid_lyap, digits = 3))")
 
 # --- figures ----------------------------------------------------------------
 if save_figures
-    sfx = quad ? "_quad" : ""
+    sfx = (quad ? "_quad" : "") * (partial ? "_partial" : "")
     X_climate = predict_closed(range(0.0, t_climate; step = dt))   # long climate run
     plot_forecast(t_te, test_data, X_pred, "figures/lorenz_LPCTESN$(sfx).png";
                   t_valid = t_valid,
@@ -123,7 +128,11 @@ if save_figures
                           "(closed-loop valid for $(round(t_valid_lyap, digits = 1)) Lyapunov times)")
     plot_forecast_3d(test_data, X_pred, "figures/lorenz3d_LPCTESN$(sfx).png";
                      title = "LPCTESN$(quad ? " (quadratic)" : ""): closed-loop Lorenz forecast")
-    plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_LPCTESN$(sfx).png")
+    # model/panel: this is panel a) of the return-map figure in the manuscript,
+    # paired with the FHN panel from RC_FHN_NN.jl
+    plot_lorenz_map(train_data, X_climate, "figures/lorenz_map_LPCTESN$(sfx).png";
+                    model = "LPCTESN, $(quad ? "quadratic" : "linear") readout ($NR nodes)",
+                    panel = "a)")
     println("Figures: figures/lorenz_LPCTESN$(sfx).png, lorenz3d_LPCTESN$(sfx).png, ",
             "lorenz_map_LPCTESN$(sfx).png")
 end
