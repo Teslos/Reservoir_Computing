@@ -7,7 +7,7 @@ using OrdinaryDiffEq
 using LinearAlgebra
 using Random
 using Statistics
-using CairoMakie
+using CairoMakie   # also re-exports @L_str, used for the Lorenz-map axis labels
 
 export lorenz!, generate_lorenz_split, generate_reservoir, drive_reservoir,
        closed_loop_forecast, Standardizer, transform, inverse_transform,
@@ -236,8 +236,10 @@ pointwise can still reproduce this "climate" of the attractor.
 """
 function plot_lorenz_map(truth_traj, pred_traj, path::AbstractString)
     fig = Figure(size = (700, 600))
+    # LaTeX strings: as plain strings the axis labels rendered the underscore
+    # literally ("z_n", "z_n+1") instead of subscripting it.
     ax = Axis(fig[1, 1], title = "Lorenz map (successive z-maxima)",
-              xlabel = "z_n", ylabel = "z_n+1")
+              xlabel = L"z_n", ylabel = L"z_{n+1}")
     mt = find_maxima_in_z(truth_traj)
     mp = find_maxima_in_z(pred_traj)
     scatter!(ax, mt[1:(end - 1)], mt[2:end], color = (:black, 0.6),
