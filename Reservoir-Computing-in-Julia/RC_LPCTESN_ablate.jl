@@ -111,7 +111,8 @@ reconstruct(sol) = quad ?
 
 r_end = R_train[:, end]
 predict_closed(tgrid) = begin
-    sol = solve(ODEProblem(closed_rhs, copy(r_end), (tgrid[1], tgrid[end])),
+    # `r_end` is the state at the training boundary (relative time zero).
+    sol = solve(ODEProblem(closed_rhs, copy(r_end), (0.0, tgrid[end])),
                 Tsit5(); saveat = tgrid, abstol = 1e-6, reltol = 1e-6)
     inverse_transform(scaler, reconstruct(sol))
 end

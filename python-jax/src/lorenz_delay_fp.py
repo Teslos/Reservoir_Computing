@@ -232,7 +232,7 @@ def valid_time(truth, pred, dt):
     scale = jnp.sqrt(jnp.mean(jnp.sum((truth-truth.mean(0))**2, axis=1)))
     error = jnp.sqrt(jnp.sum((truth-pred)**2, axis=1))/scale
     bad = np.flatnonzero(np.asarray(error) > .4)
-    seconds = (bad[0] if len(bad) else len(truth)-1)*dt
+    seconds = (bad[0] + 1 if len(bad) else len(truth))*dt
     return seconds, seconds*LYAPUNOV
 
 

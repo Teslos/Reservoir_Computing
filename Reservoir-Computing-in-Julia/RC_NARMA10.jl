@@ -127,15 +127,17 @@ local y_te_example
 for s in 1:n_seeds
     rng = MersenneTwister(SEED0 + s)
     u, y = narma10(n_train + n_test + 1; rng = rng)
-    tr = (washout + 1):n_train
-    te = (n_train + 1):(n_train + n_test)
+    # R[:, t] is the state after consuming u[t], while the recurrence above
+    # defines y[t+1] from u[t]. Pair each feature with that next-step target.
+    tr = washout:(n_train - 1)
+    te = n_train:(n_train + n_test - 1)
     for (name, gen) in RESERVOIRS
         F = gen(u, rng)
-        err, yhat = eval_readout(F[:, tr], y[tr], F[:, te], y[te]; beta = ridge_beta)
+        err, yhat = eval_readout(F[:, tr], y[tr .+ 1], F[:, te], y[te .+ 1]; beta = ridge_beta)
         push!(results[name], err)
         if s == 1
             example[name] = yhat
-            global y_te_example = y[te]
+            global y_te_example = y[te .+ 1]
         end
     end
     @printf("  seed %d: %s\n", s,

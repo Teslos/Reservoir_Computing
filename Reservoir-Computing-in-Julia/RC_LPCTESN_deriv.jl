@@ -104,7 +104,8 @@ function closed_rhs(dz, z, p, t)
 end
 
 z0 = vcat(R_train[:, end], u_train[end, :])
-sol = solve(ODEProblem(closed_rhs, z0, (t_te[1], t_te[end])), Tsit5();
+# `z0` belongs to the training boundary, so advance from relative time zero.
+sol = solve(ODEProblem(closed_rhs, z0, (0.0, t_te[end])), Tsit5();
             saveat = t_te, abstol = 1e-6, reltol = 1e-6)
 U_pred_std = Array(sol)[NR+1:NR+3, :]'
 X_pred = inverse_transform(scaler, U_pred_std)

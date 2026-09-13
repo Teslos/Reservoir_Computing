@@ -77,7 +77,9 @@ a_hi = a_hi_arg === nothing ? 1.10 : parse(Float64, ARGS[a_hi_arg][6:end])
                           # since purely excitable nodes decay to quiescence once
                           # the forecast diverges. The sweep over a_lo/a_hi tests
                           # that rationale directly.
-coupling = 0.3            # total in-coupling per node (degree-normalized)
+coupling = coupling_arg === nothing ? 0.3 : parse(Float64, ARGS[coupling_arg][10:end])
+                           # total in-coupling per node (degree-normalized)
+coupling >= 0 || error("coupling must be non-negative")
 R0 = 0.5                  # input coupling into the slow variable
 speed = 20.0              # global time-scale factor: matches the oscillator
                           # response time to the ~1 s Lorenz oscillations,
@@ -98,7 +100,8 @@ mkpath("figures")
 function build_graph(kind::Symbol, n::Int, rng::AbstractRNG)
     g = kind === :erdos_renyi    ? erdos_renyi(n, 0.1; rng = rng) :
         kind === :complete       ? complete_graph(n) :
-        kind === :grid           ? Graphs.grid([isqrt(n), isqrt(n)]) :
+        kind === :grid           ? (isqrt(n)^2 == n ? Graphs.grid([isqrt(n), isqrt(n)]) :
+                                   error("grid topology requires nodes to be a perfect square")) :
         kind === :watts_strogatz ? watts_strogatz(n, 8, 0.25; rng = rng) :
         kind === :barabasi_albert ? barabasi_albert(n, 4; rng = rng) :
         error("unknown topology $kind")
@@ -349,12 +352,15 @@ X_pred_closed = inverse_transform(scaler, pred_closed_n)
 # --- open-loop (teacher-forced) one-step prediction, for comparison only --------------
 s_test = use_lobe ? lobe_series(u_test[:, 1], dt, gamma_lobe, kappa_lobe;
                                 s0 = s_train[end]) : zeros(size(u_test, 1))
-U_test_drive = partial ? u_test[:, 1:1]' : u_test'
-use_lobe && (U_test_drive = vcat(U_test_drive, s_test'))
+t_test_drive = vcat(0.0, t_test)
+u_test_drive = vcat(u_train[end:end, :], u_test)
+s_test_drive = vcat(s_train[end], s_test)
+U_test_drive = partial ? u_test_drive[:, 1:1]' : u_test_drive'
+use_lobe && (U_test_drive = vcat(U_test_drive, s_test_drive'))
 G_test = W_in * U_test_drive
-input_test = make_lerp(t_test, G_test)
+input_test = make_lerp(t_test_drive, G_test)
 fhn_test! = make_fhn_rhs(Wc, in_strength, eps_fhn, a_fhn, R0, speed, input_test)
-prob_test = ODEProblem(fhn_test!, r_end, (t_test[1], t_test[end]))
+prob_test = ODEProblem(fhn_test!, r_end, (0.0, t_test[end]))
 sol_test = solve(prob_test, Tsit5(); saveat = t_test,
                  abstol = 1e-6, reltol = 1e-6)
 # prepend the training tail so the delayed features are defined from the
@@ -367,7 +373,7 @@ X_pred_open = inverse_transform(scaler, Matrix(pred_open_n))
 
 # --- evaluation -------------------------------------------------------------------------
 t_valid, t_valid_lyap = valid_prediction_time(test_data, X_pred_closed, t_test)
-n_short = round(Int, 1 / (LORENZ_LYAPUNOV * dt))
+n_short = min(length(t_test), round(Int, 1 / (LORENZ_LYAPUNOV * dt)))
 mse_1lyap = mean(abs2, test_data[1:n_short, :] .- X_pred_closed[1:n_short, :])
 mse_open = mean(abs2, test_data .- X_pred_open)
 println("Closed-loop valid prediction time: $(round(t_valid, digits = 2)) s ",
@@ -377,6 +383,7 @@ println("Open-loop (teacher-forced) MSE over the whole test set: ", mse_open)
 
 # machine-readable summary line for seed sweeps
 println("RESULT topology=$topology seed=$SEED readout=$readout_kind ",
+        "nodes=$N coupling=$coupling sigma_in=$sigma_in a_lo=$a_lo a_hi=$a_hi ",
         readout_kind === :ridge ? "beta=$ridge_beta " : "",
         readout_kind === :nn && use_quad ? "quad=true " : "",
         readout_kind === :nn ? "hidden=$n_hidden " : "",

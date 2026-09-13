@@ -1,4 +1,4 @@
-# Finer hyperparameter sweep for the SHD reservoir: vary ESN `leak` and FHN
+# Validation-only hyperparameter sweep for the SHD reservoir: vary ESN `leak` and FHN
 # `speed` (the two "memory depth" levers identified as dominant for SHD) while
 # holding everything else fixed at the tuned values from RC_SHD.jl.
 #
@@ -6,8 +6,8 @@
 # built ONCE and reused across every sweep point, so the only thing changing is
 # the knob under study -- the accuracy differences are attributable to it alone.
 #
-# A moderate subsample is used (the FHN ODE is the bottleneck); this finds the
-# relative optimum reliably. Re-confirm the winner at full size in RC_SHD.jl.
+# A moderate subsample is used (the FHN ODE is the bottleneck). The official
+# SHD test split is evaluated exactly once, after the validation winner is fixed.
 #
 # Run:
 #   julia --project=. Reservoir-Computing-in-Julia/RC_SHD_sweep.jl [seed] [quick] [nofhn] [nofigs]
@@ -64,7 +64,22 @@ let tri = subsample(ytr, TRAIN_PER; rng=rng), tei = subsample(yte, TEST_PER; rng
     global Xtr_r, ytr, Xte_r, yte = Xtr_r[tri,:,:], ytr[tri], Xte_r[tei,:,:], yte[tei]
 end
 ntr, nte = length(ytr), length(yte)
-println("SHD sweep: $ntr train / $nte test, $C ch x $T bins, NR=$NR, seed=$SEED")
+
+"Stratified fit/validation indices drawn only from the official training split."
+function stratified_fit_validation(y; validation_fraction=0.2, rng)
+    fit = Int[]; validation = Int[]
+    for c in unique(y)
+        ids = shuffle(rng, findall(==(c), y))
+        nval = clamp(round(Int, validation_fraction * length(ids)), 1, length(ids) - 1)
+        append!(validation, ids[1:nval]); append!(fit, ids[(nval + 1):end])
+    end
+    return shuffle(rng, fit), shuffle(rng, validation)
+end
+fit_idx, val_idx = stratified_fit_validation(ytr; rng)
+Xfit, yfit = Xtr_r[fit_idx, :, :], ytr[fit_idx]
+Xval, yval = Xtr_r[val_idx, :, :], ytr[val_idx]
+println("SHD sweep: $(length(yfit)) fit / $(length(yval)) validation / $nte final test, " *
+        "$C ch x $T bins, NR=$NR, seed=$SEED")
 
 sample(X, n) = @view X[n, :, :]
 
@@ -74,13 +89,13 @@ function onehot(y)
     return Y
 end
 
-function classify(Ftr, Fte)
+function classify(Ftr, ytrain, Fte, ytest)
     mu = vec(mean(Ftr, dims=2)); sd = vec(std(Ftr, dims=2)) .+ 1e-8
     Ftr = (Ftr .- mu) ./ sd; Fte = (Fte .- mu) ./ sd
     Φtr = vcat(Ftr, ones(1, size(Ftr, 2))); Φte = vcat(Fte, ones(1, size(Fte, 2)))
-    Wout = (onehot(ytr) * Φtr') / (Φtr * Φtr' + ridge_beta * I)
+    Wout = (onehot(ytrain) * Φtr') / (Φtr * Φtr' + ridge_beta * I)
     pred = [classes[argmax(col)] for col in eachcol(Wout * Φte)]
-    return mean(pred .== yte)
+    return mean(pred .== ytest)
 end
 
 const K_SNAP = 8
@@ -124,7 +139,8 @@ Win = sigma_in .* (2 .* rand(rng, NR, C) .- 1)
 esn_results = Pair{Float64,Float64}[]
 println("\nESN leak sweep:")
 for leak in leak_grid
-    acc = classify(esn_features(Xtr_r, A, Win, leak), esn_features(Xte_r, A, Win, leak))
+    acc = classify(esn_features(Xfit, A, Win, leak), yfit,
+                   esn_features(Xval, A, Win, leak), yval)
     push!(esn_results, leak => acc)
     @printf("  leak=%.3f  acc=%.3f\n", leak, acc)
 end
@@ -137,8 +153,8 @@ if run_fhn
     a = a_lo .+ (a_hi - a_lo) .* rand(rng, NR)
     println("\nFHN speed sweep:")
     for speed in speed_grid
-        acc = classify(fhn_features(Xtr_r, Af, Winf, a, speed),
-                       fhn_features(Xte_r, Af, Winf, a, speed))
+        acc = classify(fhn_features(Xfit, Af, Winf, a, speed), yfit,
+                       fhn_features(Xval, Af, Winf, a, speed), yval)
         push!(fhn_results, speed => acc)
         @printf("  speed=%.3f  acc=%.3f\n", speed, acc)
     end
@@ -147,35 +163,46 @@ end
 # --- report -----------------------------------------------------------------
 best_leak  = esn_results[argmax([a for (_, a) in esn_results])]
 best_speed = isempty(fhn_results) ? nothing : fhn_results[argmax([a for (_, a) in fhn_results])]
-println("\nBest ESN leak:  $(best_leak[1]) -> $(round(best_leak[2], digits=3))")
-best_speed !== nothing && println("Best FHN speed: $(best_speed[1]) -> $(round(best_speed[2], digits=3))")
+esn_test = classify(esn_features(Xtr_r, A, Win, best_leak[1]), ytr,
+                    esn_features(Xte_r, A, Win, best_leak[1]), yte)
+fhn_test = best_speed === nothing ? nothing :
+    classify(fhn_features(Xtr_r, Af, Winf, a, best_speed[1]), ytr,
+             fhn_features(Xte_r, Af, Winf, a, best_speed[1]), yte)
+println("\nBest ESN leak on validation: $(best_leak[1]) -> $(round(best_leak[2], digits=3)); " *
+        "one-shot test accuracy $(round(esn_test, digits=3))")
+best_speed !== nothing && println("Best FHN speed on validation: $(best_speed[1]) -> " *
+    "$(round(best_speed[2], digits=3)); one-shot test accuracy $(round(fhn_test, digits=3))")
 
-open(joinpath(@__DIR__, "..", "shd_sweep_results.md"), "w") do io
+outfile = joinpath(@__DIR__, "..", "shd_sweep_results.md")
+open(outfile, "w") do io
     println(io, "# SHD leak/speed sweep\n")
-    println(io, "$ntr train / $nte test, $C channels × $T bins, NR=$NR, seed=$SEED, ",
+    println(io, "$(length(yfit)) fit / $(length(yval)) validation / $nte final test, " *
+                "$C channels × $T bins, NR=$NR, seed=$SEED, ",
                 "ridge β=$ridge_beta, sr=$sr_esn. Everything else fixed at RC_SHD.jl values.\n")
     println(io, "## ESN leak (memory depth)\n")
-    println(io, "| leak | test acc |\n|---|---|")
+    println(io, "| leak | validation acc |\n|---|---|")
     for (l, acc) in esn_results; println(io, @sprintf("| %.3f | %.3f |", l, acc)); end
-    println(io, "\n**Best leak = $(best_leak[1])** (acc $(round(best_leak[2], digits=3)))\n")
+    println(io, "\n**Best leak = $(best_leak[1])** (validation $(round(best_leak[2], digits=3)); " *
+                "one-shot test $(round(esn_test, digits=3)))\n")
     if best_speed !== nothing
         println(io, "## FHN speed (slow dynamics = memory depth)\n")
-        println(io, "| speed | test acc |\n|---|---|")
+        println(io, "| speed | validation acc |\n|---|---|")
         for (s, acc) in fhn_results; println(io, @sprintf("| %.3f | %.3f |", s, acc)); end
-        println(io, "\n**Best speed = $(best_speed[1])** (acc $(round(best_speed[2], digits=3)))")
+        println(io, "\n**Best speed = $(best_speed[1])** (validation $(round(best_speed[2], digits=3)); " *
+                    "one-shot test $(round(fhn_test, digits=3)))")
     end
 end
 
 if save_figures
     fig = Figure(size=(820, 360))
-    ax1 = Axis(fig[1, 1], xlabel="ESN leak", ylabel="test accuracy",
-               title="ESN leak sweep", xscale=log10)
+    ax1 = Axis(fig[1, 1], xlabel="ESN leak", ylabel="validation accuracy",
+               title="ESN leak validation sweep", xscale=log10)
     scatterlines!(ax1, [l for (l, _) in esn_results], [a for (_, a) in esn_results],
                   color=:seagreen)
     vlines!(ax1, [0.05], color=:gray, linestyle=:dash)   # previous value
     if best_speed !== nothing
-        ax2 = Axis(fig[1, 2], xlabel="FHN speed", ylabel="test accuracy",
-                   title="FHN speed sweep")
+        ax2 = Axis(fig[1, 2], xlabel="FHN speed", ylabel="validation accuracy",
+                   title="FHN speed validation sweep")
         scatterlines!(ax2, [s for (s, _) in fhn_results], [a for (_, a) in fhn_results],
                       color=:crimson)
         vlines!(ax2, [0.5], color=:gray, linestyle=:dash)
@@ -183,4 +210,4 @@ if save_figures
     save(joinpath(@__DIR__, "..", "figures", "shd_sweep.png"), fig)
     println("Figure: figures/shd_sweep.png")
 end
-println("Wrote shd_sweep_results.md")
+println("Wrote $outfile")

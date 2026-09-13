@@ -66,7 +66,7 @@ X_predicted = inverse_transform(scaler, pred_n)
 
 # --- evaluation ---------------------------------------------------------------
 t_valid, t_valid_lyap = valid_prediction_time(test_data, X_predicted, t_test)
-n_short = round(Int, 1 / (LORENZ_LYAPUNOV * dt))   # one Lyapunov time
+n_short = min(length(t_test), round(Int, 1 / (LORENZ_LYAPUNOV * dt)))
 mse_1lyap = mean(abs2, test_data[1:n_short, :] .- X_predicted[1:n_short, :])
 println("Valid prediction time: $(round(t_valid, digits = 2)) s ",
         "($(round(t_valid_lyap, digits = 2)) Lyapunov times)")

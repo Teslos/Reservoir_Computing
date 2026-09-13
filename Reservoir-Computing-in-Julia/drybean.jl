@@ -5,7 +5,6 @@ export read_drybean
 
 using CSV
 using DataFrames
-using Plots
 
 # Read the dry bean dataset
 function read_drybean(file="./data/DryBeanDataset.csv")

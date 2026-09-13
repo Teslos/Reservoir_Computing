@@ -65,6 +65,8 @@ function generate_reservoir(rng::AbstractRNG, dim::Int, density::Float64;
                             spectral_radius::Float64 = 0.9)
     A = (rand(rng, dim, dim) .< density) .* (2 .* rand(rng, dim, dim) .- 1)
     rho = maximum(abs.(eigvals(A)))
+    rho > eps(Float64) || throw(ArgumentError(
+        "generated reservoir has zero spectral radius; increase dim or density"))
     return A .* (spectral_radius / rho)
 end
 
@@ -119,8 +121,14 @@ struct Standardizer
     sigma::Vector{Float64}
 end
 
-Standardizer(X::AbstractMatrix) =
-    Standardizer(vec(mean(X, dims = 1)), vec(std(X, dims = 1)))
+function Standardizer(X::AbstractMatrix)
+    mu = vec(mean(X, dims = 1))
+    sigma = vec(std(X, dims = 1))
+    # Constant features carry no scale information; leave them centered without
+    # dividing by zero so this helper remains safe outside the Lorenz scripts.
+    sigma[.!isfinite.(sigma) .| (sigma .<= eps(Float64))] .= 1.0
+    return Standardizer(mu, sigma)
+end
 
 transform(s::Standardizer, X::AbstractMatrix) = (X .- s.mu') ./ s.sigma'
 inverse_transform(s::Standardizer, X::AbstractMatrix) = X .* s.sigma' .+ s.mu'
@@ -145,10 +153,19 @@ trajectory divergence is guaranteed.
 """
 function valid_prediction_time(truth::AbstractMatrix, pred::AbstractMatrix,
                                t::AbstractVector; threshold = 0.4)
+    size(truth) == size(pred) || throw(DimensionMismatch(
+        "truth and prediction must have identical shapes"))
+    size(truth, 1) == length(t) || throw(DimensionMismatch(
+        "time vector length must match the number of samples"))
+    threshold > 0 || throw(ArgumentError("threshold must be positive"))
     scale = sqrt(mean(sum(abs2, truth .- mean(truth, dims = 1), dims = 2)))
+    scale > eps(Float64) || throw(ArgumentError(
+        "valid prediction time is undefined for a constant truth trajectory"))
     err = sqrt.(vec(sum(abs2, truth .- pred, dims = 2))) ./ scale
     idx = findfirst(>(threshold), err)
-    t_valid = idx === nothing ? t[end] - t[1] : t[idx] - t[1]
+    # Forecast grids are relative to the train/test boundary. For the usual
+    # next-step grid, t[1] == dt, so a first-sample failure occurs at dt—not 0.
+    t_valid = idx === nothing ? t[end] : t[idx]
     return t_valid, t_valid * LORENZ_LYAPUNOV
 end
 
@@ -160,7 +177,12 @@ the uniform time grid `t`. Used to drive a continuous-time reservoir with
 discretely sampled input.
 """
 function make_lerp(t::AbstractVector, G::AbstractMatrix)
+    length(t) >= 2 || throw(ArgumentError("interpolation requires at least two times"))
+    size(G, 2) == length(t) || throw(DimensionMismatch(
+        "G must have one column per interpolation time"))
     dt = t[2] - t[1]
+    dt > 0 || throw(ArgumentError("interpolation times must be strictly increasing"))
+    all(diff(t) .> 0) || throw(ArgumentError("interpolation times must be strictly increasing"))
     n = length(t)
     return tau -> begin
         s = clamp((tau - t[1]) / dt + 1, 1.0, Float64(n))
@@ -208,7 +230,7 @@ function plot_forecast(t, truth, pred, path::AbstractString;
                    linestyle = :dash, label = "Open-loop (teacher-forced)")
         end
         if t_valid !== nothing
-            vlines!(ax, [t[1] + t_valid], color = :gray, linestyle = :dot)
+            vlines!(ax, [t_valid], color = :gray, linestyle = :dot)
         end
         k == 1 && axislegend(ax, position = :rt, framevisible = false)
     end

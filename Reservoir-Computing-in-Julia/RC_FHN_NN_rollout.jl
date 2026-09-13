@@ -44,6 +44,7 @@ val_steps    = ival("val_steps", 2500)   # held-out tail of teacher-forced train
 n_val_starts = ival("val_starts", 16)
 eval_steps   = ival("eval_steps", 500)   # 5 s multi-start evaluation horizon
 n_eval_starts = ival("eval_starts", 20)
+eval_tail_steps = ival("eval_tail_steps", 2500) # independent tail after validation
 
 dim_system = 3; dt = 0.01; washout = 500; delay_steps = 10
 sigma_in = 1.5; eps_fhn = 0.05; a_lo, a_hi = 0.95, 1.1
@@ -56,7 +57,8 @@ rng = MersenneTwister(SEED); Random.seed!(SEED)
 function build_graph(kind, n, rng)
     g = kind === :erdos_renyi ? erdos_renyi(n, 0.1; rng = rng) :
         kind === :complete ? complete_graph(n) :
-        kind === :grid ? Graphs.grid([isqrt(n), isqrt(n)]) :
+        kind === :grid ? (isqrt(n)^2 == n ? Graphs.grid([isqrt(n), isqrt(n)]) :
+                          error("grid topology requires nodes to be a perfect square")) :
         kind === :watts_strogatz ? watts_strogatz(n, 8, 0.25; rng = rng) :
         kind === :barabasi_albert ? barabasi_albert(n, 4; rng = rng) :
         error("unknown topology $kind")
@@ -76,7 +78,11 @@ a_fhn = a_lo .+ (a_hi - a_lo) .* rand(rng, N)
 
 train_data, t_train, test_data, t_test =
     generate_lorenz_split(t_train = 200.0, t_test = 25.0, dt = dt)
-scaler = Standardizer(train_data)
+n_tr = size(train_data, 1)
+train_end = n_tr - val_steps - eval_tail_steps
+train_end > washout + 2delay_steps + K_roll ||
+    error("validation/evaluation tails leave too little rollout-training data")
+scaler = Standardizer(train_data[1:train_end, :])
 u_train = transform(scaler, train_data)
 W_in = 2 * sigma_in .* (rand(rng, N, dim_system) .- 0.5)
 
@@ -97,10 +103,6 @@ function rk4(u, w, gin)
      w .+ (dt / 6) .* (k1w .+ 2k2w .+ 2k3w .+ k4w))
 end
 
-n_tr = size(u_train, 1)
-train_end = n_tr - val_steps
-train_end > washout + 2delay_steps + K_roll ||
-    error("val_steps=$val_steps leaves too little rollout-training data")
 R_train = zeros(2N, n_tr)
 for i in 1:(n_tr - 1)
     un, wn = rk4(@view(R_train[1:N, i]), @view(R_train[(N+1):2N, i]),
@@ -169,9 +171,10 @@ function rollout_loss(m, t0, K)
 end
 
 opt_roll = Flux.setup(Adam(roll_lr), model)
-val_lo, val_hi = train_end, n_tr - K_roll
+val_lo, val_hi = train_end, n_tr - eval_tail_steps - K_roll
 val_starts = unique(round.(Int, range(val_lo, val_hi; length = n_val_starts)))
-checkpoint_path = joinpath("data", "fhn_rollout_best_seed$(SEED)_N$(N)_K$(K_roll).jls")
+checkpoint_path = joinpath("data",
+    "fhn_rollout_best_$(topology)_seed$(SEED)_N$(N)_K$(K_roll)_H$(n_hidden).jls")
 mkpath(dirname(checkpoint_path))
 best_val = Inf
 best_epoch = 0
@@ -180,8 +183,8 @@ best_state = deepcopy(Flux.state(model))
 @printf("stage 2: smooth curriculum to K=%d (%.2f s), %d epochs (%d at full K), %d batches x %d, lr %.0e\n",
         K_roll, K_roll * dt, roll_epochs, final_epochs,
         roll_batches, batch_roll, roll_lr)
-@printf("validation: %d fixed starts in held-out final %.1f s; checkpoint %s\n",
-        length(val_starts), val_steps * dt, checkpoint_path)
+@printf("validation: %d fixed starts in %.1f s validation tail; independent evaluation tail %.1f s; checkpoint %s\n",
+        length(val_starts), val_steps * dt, eval_tail_steps * dt, checkpoint_path)
 flush(stdout)
 for epoch in 1:roll_epochs
     tot = 0.0f0
@@ -246,9 +249,11 @@ t_valid, t_valid_lyap = valid_prediction_time(test_data, X_pred, t_test)
         t_valid, t_valid_lyap)
 
 # Report robustness across many unseen forecast boundaries, rather than relying
-# on the single train/test boundary.  These starts lie only in the held-out tail.
+# on the single train/test boundary. These starts lie only in an evaluation tail
+# that was not used for fitting or checkpoint selection.
 eval_hi = n_tr - eval_steps
-eval_starts = unique(round.(Int, range(train_end, eval_hi; length = n_eval_starts)))
+eval_lo = n_tr - eval_tail_steps
+eval_starts = unique(round.(Int, range(eval_lo, eval_hi; length = n_eval_starts)))
 multi_lyap = Float64[]
 eval_t = collect(dt:dt:(eval_steps * dt))
 for t0 in eval_starts

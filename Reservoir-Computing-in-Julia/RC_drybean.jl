@@ -1,221 +1,127 @@
-using OrdinaryDiffEq
-using LinearAlgebra
-using NNlib: swish
-using Flux: onehotbatch, shuffle, DataLoader 
-using Random
-using MLUtils: splitobs
-using Lux 
-using Flux: pullback, onecold, onehotbatch, softmax
-using Optimisers
-using Distributions
-using Plots
+# Dry Bean classification with a fixed random reservoir and ridge readout.
+#
+# The original script accidentally constructed its test loader from the training
+# tensors, evolved one reservoir state across unrelated samples, and ended in a
+# stale Lorenz-forecast block containing undefined variables. This version uses a
+# stratified split, fits normalization on training data only, resets the reservoir
+# for every bean, and evaluates the test split exactly once.
 
 include("drybean.jl")
-include("spikerate.jl")
+using .drybean
+using DataFrames
+using LinearAlgebra
+using NNlib: swish
+using Random
+using Statistics
+using Printf
 
-function load_data(x, y, train_ratio = 0.8, batchsize=256)
-    rng = MersenneTwister(1234)
-    num_samples = size(x, 2)
-    classes = unique(y)
+seed_arg = findfirst(a -> tryparse(Int, a) !== nothing, ARGS)
+SEED = seed_arg === nothing ? 1234 : parse(Int, ARGS[seed_arg])
+quick = "quick" in ARGS
+save_figures = !("nofigs" in ARGS)
 
-    # split the data
-    y = onehotbatch(y, classes)
-    (train_x, train_y), (test_x, test_y) = splitobs((x,y); at=train_ratio)
-    return (
-        # Use dataloader to automatically shuffle and batch the data
-        DataLoader(collect.((train_x, train_y)); batchsize, shuffle = true),
-        # dont shuffle the test data
-        DataLoader(collect.((train_x, train_y)); batchsize, shuffle = false)
-    )
+NR = quick ? 64 : 200
+density = 0.05
+spectral_radius = 0.9
+sigma_in = 0.2
+leak = 0.9
+settle_steps = quick ? 3 : 5
+ridge_beta = 1e-2
+rng = MersenneTwister(SEED)
+
+function generate_reservoir(rng, dim, density; spectral_radius)
+    A = (rand(rng, dim, dim) .< density) .* (2 .* rand(rng, dim, dim) .- 1)
+    rho = maximum(abs, eigvals(A))
+    rho > eps(Float64) || error("zero-radius reservoir; increase NR or density")
+    return A .* (spectral_radius / rho)
 end
 
-function generate_reservoir(dim_reservoir, density)
-    A = rand(dim_reservoir, dim_reservoir)
-    A = A .< density
-    ran = 2*(rand(dim_reservoir, dim_reservoir) .- 0.5)
-    A = A.*ran
-    # get eigenvalues of A
-    eigA = eigvals(A)
-    # set spectral radius of A to 1
-    A = A./maximum(abs.(eigA))
-    return A
-end
+data_path = joinpath(@__DIR__, "data", "DryBeanDataset.csv")
+isfile(data_path) || error("missing Dry Bean dataset: $data_path")
+db = read_drybean(data_path)
+X = Matrix{Float64}(db[:, 1:16])'
+labels = String.(db[:, 17])
+classes = sort(unique(labels))
 
-# read the dry bean dataset
-db = drybean.read_drybean()
-x = Matrix(permutedims(db))
-function normalize_rows(x::AbstractMatrix)
-    x = x ./ maximum(x, dims=2)
-    return x
-end
-# target vector
-y = x[17,:]
-x = normalize_rows(x[1:16,:])
-classes = unique(y)
-onehot_y = onehotbatch(y, classes)
-
-
-train_dataloader, test_dataloader = load_data(x, y, 0.8)
-
-
-function reservoir_init()
-    dim_system = 16
-    dim_reservoir = 500
-
-    sigma = 0.1
-    density = 0.05 # density of the reservoir
-    beta = 0.01 # regularization parameter
-    α = 1.0
-    r_state = zeros(dim_reservoir)
-    A = generate_reservoir(dim_reservoir, density)
-    W_in = 2*sigma*(rand(dim_reservoir, dim_system) .- 0.5)
-
-    W_out = zeros(dim_system, dim_reservoir)
-    
-    return A, W_in, W_out, r_state
-end
-
-function reservoir_compute(train_data, time_length, W_in, A, r_state)
-    dim_reservoir = size(A, 1)
-    R = zeros(dim_reservoir, time_length)
-    α = 0.9
-    for i in 1:time_length
-        R[:,i] = r_state
-        #r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*train_data[i,:])))
-        #r_state = 1.0 .+ tanh.(A*r_state + W_in*train_data[i,:])
-        r_state = (1-α)*r_state + α * swish.(A*r_state + W_in*train_data[i,:]) # new state r_state(t+1)
+"Return stratified train/test indices without inspecting feature values."
+function stratified_split(labels; train_fraction=0.8, rng)
+    train_idx = Int[]; test_idx = Int[]
+    for class in unique(labels)
+        ids = shuffle(rng, findall(==(class), labels))
+        ntrain = clamp(round(Int, train_fraction * length(ids)), 1, length(ids) - 1)
+        append!(train_idx, ids[1:ntrain])
+        append!(test_idx, ids[(ntrain + 1):end])
     end
-    return R # return the states of the reservoir
+    return shuffle(rng, train_idx), shuffle(rng, test_idx)
 end
 
-function create_model()
-    return Lux.Chain(
-        Lux.Dense(16, 16, sigmoid),
-        Lux.Dense(16, 7), softmax
-    )
-end
+train_idx, test_idx = stratified_split(labels; rng)
+X_train, X_test = X[:, train_idx], X[:, test_idx]
+y_train, y_test = labels[train_idx], labels[test_idx]
 
-# loss function for the model is crossentropy
-function loss(x, y, model, ps, st)
-    y_pred, st = model(x, ps, st)
-   
-    lossv = -mean(sum(y .* log.(softmax(y_pred)), dims=1))
-    #println("lossv:",lossv)
-    return lossv, st
-end
+# Train-only min/max scaling. Constant columns remain finite.
+xmin = minimum(X_train, dims = 2)
+xrange = maximum(X_train, dims = 2) .- xmin
+xrange[xrange .<= eps(Float64)] .= 1.0
+X_train = (X_train .- xmin) ./ xrange
+X_test = (X_test .- xmin) ./ xrange
 
-function partition(data, batch_size)
-    x, y = data
-    return ((x[i:min(i+batch_size-1, end),:], y[:,i:min(i+batch_size-1, end)]) for i in 1:batch_size:size(x, 1))
-end
-
-function accuracy(model, ps, st, dataloader, A, W_in, W_out, r_state)
-    beta = 0.01
-    dim_reservoir = size(A, 1)
-    total_correct, total = 0, 0
-    st = Lux.testmode(st)
-    for (x,y) in dataloader
-        target_class = onecold(y)
-        
-        x = x'
-        R = reservoir_compute(x, size(x,1), W_in, A, r_state)
-        W_out = (x'*R')*inv( (R*R') + beta * I(dim_reservoir) )
-        y_out = W_out*R[:,1:end] # output of the reservoir
-        predict_class = model(y_out, ps, st)
-        
-        predicted_class = onecold(Array(first(predict_class)))
-        println("predicted_class:",predicted_class)
-        #exit()
-        total_correct += sum(target_class .== predicted_class)
-        total += length(y)
+function onehot(labels)
+    Y = zeros(length(classes), length(labels))
+    for (j, label) in enumerate(labels)
+        Y[findfirst(==(label), classes), j] = 1.0
     end
-    return total_correct / total
+    return Y
 end
 
-loss_function(x, y, model, ps, states) = loss(x, y, model, ps, states)
-
-function train_model(model, train_dataloader, test_dataloader; epochs=10, batch_size=256, learning_rate=0.001)
-    ps, st = Lux.setup(rng, model)
-    dim_reservoir = 500
-    beta = 0.01 # regularization parameter
-    opt = Optimisers.Adam(learning_rate)
-    st_opt = Optimisers.setup(opt, ps)
-    
-    A, W_in, W_out, r_state  = reservoir_init()
-
-    # train loop
-    for epoch in 1:epochs
-        for (x, y) in train_dataloader
-            #println("x:",size(x),"y:",size(y))
-            # do reservoir computation
-            x = x'
-            R = reservoir_compute(x, size(x,1), W_in, A, r_state)
-            # using the ridge regression to fit output weights
-            W_out = (x'*R')*inv( (R*R') + beta * I(dim_reservoir) )
-            y_out = W_out*R[:,1:end]
-            
-            (loss_value, st), back = pullback(loss_function, y_out, y, model, ps, st)
-        
-            grads = back((one(loss_value),nothing))[4]
-            st_opt, ps = Optimisers.update(st_opt, ps, grads)
-        end
-        #println("train_labels:", size(train_data[2]))
-
-        train_acc = accuracy(model, ps, st, train_dataloader,A, W_in, W_out, r_state)
-
-        test_acc = accuracy(model, ps, st, test_dataloader, A, W_in, W_out, r_state)
-        println("Epoch $epoch, Train Accuracy: $train_acc, Test Accuracy: $test_acc")
+"Drive every static sample independently with a constant input."
+function reservoir_features(X, A, W_in; steps=settle_steps)
+    R = zeros(size(A, 1), size(X, 2))
+    for _ in 1:steps
+        R = (1 - leak) .* R .+ leak .* swish.(A * R .+ W_in * X)
     end
+    return R
 end
 
-
-# Create model 
-model = create_model()
-rng = Random.seed!(1234)
-nn_rc, st_rc = Lux.setup(rng, model)
-
-# Train the model
-train_model(model, train_dataloader, test_dataloader, epochs=100, batch_size=256, learning_rate=0.001)
-
-
-
-# using the ridge regression to fit output weights
-W_out = (train_data'*R')*inv( (R*R') + beta * I(dim_reservoir) )
-
-X_predicted = zeros(length(t2), dim_system)
-r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*test_data[end,:]))) # initial state
-for i in 1:length(t2)
-    X_predicted[i,:] = W_out*r_state
-    r_state = 1.0 ./ (1 .+ exp.(-(A*r_state + W_in*X_predicted[i,:])))
-    #r_state = 1.0 .+ tanh.(A*r_state + W_in*X_predicted[i,:])
-    #r_state = (1-α)*r_state + α * swish.(A*r_state + W_in*X_predicted[i,:]) # new state r_state(t+1)
+function ridge_accuracy(F_train, y_train, F_test, y_test)
+    mu = mean(F_train, dims = 2)
+    sd = std(F_train, dims = 2)
+    sd[sd .<= eps(Float64)] .= 1.0
+    Z_train = (F_train .- mu) ./ sd
+    Z_test = (F_test .- mu) ./ sd
+    Phi_train = vcat(Z_train, ones(1, size(Z_train, 2)))
+    Phi_test = vcat(Z_test, ones(1, size(Z_test, 2)))
+    W_out = (onehot(y_train) * Phi_train') /
+            (Phi_train * Phi_train' + ridge_beta * I)
+    pred = [classes[argmax(col)] for col in eachcol(W_out * Phi_test)]
+    return mean(pred .== y_test)
 end
 
-# plot the results
-using GLMakie
+raw_accuracy = ridge_accuracy(X_train, y_train, X_test, y_test)
+A = generate_reservoir(rng, NR, density; spectral_radius)
+W_in = sigma_in .* (2 .* rand(rng, NR, size(X_train, 1)) .- 1)
+R_train = reservoir_features(X_train, A, W_in)
+R_test = reservoir_features(X_test, A, W_in)
+reservoir_accuracy = ridge_accuracy(R_train, y_train, R_test, y_test)
 
-fig = Figure()
-for i in 1:4
-    ax = Axis(fig[i, 1])
-    lines!(ax, t2, test_data[:,i], color = :blue)
-    lines!(ax, t2, X_predicted[:,i], color = :red)
+println("Dry Bean: $(length(y_train)) train / $(length(y_test)) test, " *
+        "$(length(classes)) classes, NR=$NR, seed=$SEED")
+@printf("Raw-feature ridge accuracy: %.4f\n", raw_accuracy)
+@printf("Reservoir ridge accuracy:   %.4f\n", reservoir_accuracy)
+@printf("RESULT seed=%d NR=%d raw_acc=%.4f reservoir_acc=%.4f\n",
+        SEED, NR, raw_accuracy, reservoir_accuracy)
+
+if save_figures
+    @eval using CairoMakie
+    mkpath(joinpath(@__DIR__, "..", "figures"))
+    fig = Figure(size = (620, 420))
+    ax = Axis(fig[1, 1], ylabel = "test accuracy",
+              title = "Dry Bean classification (seed $SEED)",
+              xticks = (1:2, ["raw ridge", "reservoir ridge"]))
+    barplot!(ax, 1:2, [raw_accuracy, reservoir_accuracy],
+             color = [:gray65, :seagreen])
+    ylims!(ax, 0, 1)
+    path = joinpath(@__DIR__, "..", "figures", "drybean_seed$(SEED).png")
+    save(path, fig)
+    println("Figure: $path")
 end
-
-
-fig
-GLMakie.save("dry_bean_BOMBAY.png", fig)
-
-# Create a new figure
-fig = Figure(resolution = (800, 600))
-
-# 3D plot
-ax = Axis3(fig[1, 1], title = "Predicting dry bean", xlabel = "x", ylabel = "y", zlabel = "z")
-lines!(ax, test_data[:, 1], test_data[:, 2], test_data[:, 3], color = :blue, label = "True")
-lines!(ax, X_predicted[:, 1], X_predicted[:, 2], X_predicted[:, 3], color = :red, label = "Predicted")
-
-# Add grid and legend
-axislegend(ax)
-
-# Display the figure
-fig
-GLMakie.save("drybean3d.png", fig)

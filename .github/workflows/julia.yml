@@ -1,0 +1,21 @@
+name: Julia checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - name: Instantiate environment
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+      - name: Run regression tests
+        run: julia --project=. Reservoir-Computing-in-Julia/test/runtests.jl
+      - name: Parse Python entry points
+        run: python -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('python-jax/src').glob('*.py')]"

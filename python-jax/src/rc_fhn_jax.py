@@ -213,7 +213,7 @@ def valid_prediction_time(truth, pred, dt, threshold=0.4):
     scale = np.sqrt(np.mean(np.sum((truth - truth.mean(0))**2, axis=1)))
     err = np.sqrt(np.sum((truth - pred)**2, axis=1)) / scale
     bad = np.flatnonzero(err > threshold)
-    seconds = (bad[0] if len(bad) else len(err)-1) * dt
+    seconds = (bad[0] + 1 if len(bad) else len(err)) * dt
     return seconds, seconds * LORENZ_LYAPUNOV
 
 
@@ -309,10 +309,14 @@ def main():
     pred_closed = scaler.inverse(pred_closed_n)
 
     observed_test = u_test[:, :1] if args.partial else u_test
-    r_test = drive_fhn(rhs, (observed_test @ win.T).astype(jnp.float32), r_train[-1], dt)
+    # Include the training-boundary forcing, integrate 0 -> dt, and then drop
+    # the initial state. Otherwise r_train[-1] is mislabeled as test sample one.
+    boundary_observed = observed_train[-1:]
+    test_drive = jnp.concatenate((boundary_observed, observed_test), axis=0)
+    r_test = drive_fhn(rhs, (test_drive @ win.T).astype(jnp.float32), r_train[-1], dt)[1:]
     extended = jnp.concatenate((r_train[-2*delay:], r_test), axis=0)
     pred_open = scaler.inverse(readout(delay_features(extended, delay)))
-    # drive_fhn includes the initial state, giving exactly len(test) features.
+    # Boundary-integrated test states give exactly len(test) features.
     pred_open = pred_open[:len(test)]
 
     t_valid, t_lyap = valid_prediction_time(test, pred_closed, dt)

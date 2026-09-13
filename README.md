@@ -5,9 +5,18 @@ classification. The Julia code lives in `Reservoir-Computing-in-Julia/` and
 shares utilities through `common.jl` (Lorenz data, reservoir helpers, the valid-
 prediction-time metric, and the forecast / Lorenz-map plots).
 
+> **Result regeneration notice.** The evaluation code now uses corrected
+> next-step timing and validation-only hyperparameter selection. Numerical
+> tables committed before these corrections (LPCTESN, NARMA-10, and tuned SHD
+> results) are historical and must be regenerated before they are cited.
+
 The GPU-accelerated Python/JAX port of the FHN example is in `python-jax/`.
 It is packaged with `uv` and targets the two NVIDIA GPUs on `thl06710`; see
 `python-jax/README.md` for setup and run commands.
+
+Run the lightweight Julia regression suite from the repository root with:
+
+    julia --project=. Reservoir-Computing-in-Julia/test/runtests.jl
 
 ## Lorenz-63 forecasters
 

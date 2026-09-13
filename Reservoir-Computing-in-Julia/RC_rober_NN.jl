@@ -183,8 +183,8 @@ using Plots
 # plot the solution of the robertson system
 Plots.plot(sol_rob, xscale=:log, yscale=:log, label=["y1" "y2" "y3"], xlabel="Time", ylabel="Concentration", title="Robertson System Solution")
 # generate the training data
-trober = sol.t
-train_data = hcat(sol.u...)' # train_data is the solution of the Rober system
+trober = sol_rob.t
+train_data = Array(sol_rob)' # train_data is the solution of the Robertson system
 
 # generate the testing data for the robertson system
 p0_test = (0.04, 3e7, 1.1e7)
@@ -193,7 +193,7 @@ tspan_test = (0.0, 1e5)
 tt_test = 10.0.^collect(range(-5.0, +5.0; length=33))
 # define ODEProblem, optimize it, and solve for original ODE solution at (u0_test, p0_test)
 prob_test = ODEProblem(robertson!, u0_test, tspan_test, p0_test)
-sol_test = solve(prob_test, Rosenbrock23(); abstol=1e-6, reltol=1e-6, saveat=tt)
+sol_test = solve(prob_test, Rosenbrock23(); abstol=1e-6, reltol=1e-6, saveat=tt_test)
 
 # plot the solution of the robertson system
 Plots.plot(sol_test, xscale=:log, yscale=:log, label=["y1" "y2" "y3"], xlabel="Time", ylabel="Concentration", title="Robertson System Test Solution")
@@ -212,7 +212,7 @@ A = generate_reservoir(dim_reservoir, density)
 W_in = 2*sigma*(rand(dim_reservoir, dim_system) .- 0.5)
 
 W_out = zeros(dim_system, dim_reservoir)
-R = zeros(dim_reservoir, length(tlorenz))
+R = zeros(dim_reservoir, length(trober))
 
 # Parameter handling
 N = nv(g_directed) # Number of nodes in the network
@@ -285,10 +285,10 @@ u0 = [0.7; 0.2; 0.3]; u0 = u0./sum(u0)
 R_test = zeros(dim_reservoir, length(tt))
 # get prediction of the model for test data
 ut = W_in*u0
-gs = [Spline1D(tt, (W_in*train_data')[i,:], k=2) for i in 1:nv(g_directed)]
-p = (gs,σ * w_ij)
-prob2 = remake(prob, u0=ut, p=p)
-sol2 = solve(prob2, Tsit5(), saveat=tt)
+gs_test = [Spline1D(ttest, (W_in * test_data')[i, :], k=2) for i in 1:nv(g_directed)]
+p = (gs_test, σ * w_ij)
+prob2 = remake(prob, u0=ut, p=p, tspan=(ttest[1], ttest[end]))
+sol2 = solve(prob2, Tsit5(), saveat=ttest)
 r_test = sol2[:,:]
 # plot the r_test
 fig = Figure()
